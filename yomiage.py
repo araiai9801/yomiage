@@ -125,16 +125,49 @@ def _send_ctrl_c() -> None:
 
 
 # =====================================================================
-# TTSEngine — Popen + terminate() で即座に中断可能
+# TTSEngine — edge-tts (Microsoft Nanami) + 即座に中断可能
 # =====================================================================
+# 音声名: ja-JP-NanamiNeural (女性), ja-JP-KeitaNeural (男性)
+_TTS_VOICE = "ja-JP-NanamiNeural"
+
+
+
+# MCI (winmm.dll) を Python から直接呼び出す — PowerShell 不要
+_winmm = ctypes.windll.winmm
+_mciSendStringW = _winmm.mciSendStringW
+_mciSendStringW.argtypes = [
+    ctypes.c_wchar_p,       # lpszCommand
+    ctypes.c_wchar_p,       # lpszReturnString
+    ctypes.c_uint,          # cchReturn
+    ctypes.c_void_p,        # hwndCallback
+]
+_mciSendStringW.restype = ctypes.c_int
+
+
+def _mci(cmd: str) -> int:
+    """MCI コマンドを送信して戻り値を返す"""
+    ret = _mciSendStringW(cmd, None, 0, None)
+    if ret != 0:
+        log.debug(f"MCI '{cmd}' → rc={ret}")
+    return ret
+
+
+def _mci_status(cmd: str) -> str:
+    """MCI status コマンドを送信して結果文字列を返す"""
+    buf = ctypes.create_unicode_buffer(256)
+    _mciSendStringW(cmd, buf, 256, None)
+    return buf.value
+
+
 class TTSEngine:
     def __init__(self):
         self._queue: queue.Queue[str | None] = queue.Queue()
-        self._proc: subprocess.Popen | None = None
+        self._gen_proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
-        self._speaking = threading.Event()  # 読み上げ中かどうか
-        self._done = threading.Event()      # 読み上げ完了待ち用
-        self._done.set()                    # 初期状態は「完了」
+        self._speaking = threading.Event()
+        self._stop_flag = threading.Event()
+        self._done = threading.Event()
+        self._done.set()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -145,33 +178,35 @@ class TTSEngine:
     def speak(self, text: str) -> None:
         if not text.strip():
             return
-        # キュー内の古いアイテムを破棄
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
-        self._done.clear()  # 「未完了」にセット
+        self._done.clear()
         self._queue.put(text)
 
     def wait_done(self, timeout: float | None = None) -> bool:
-        """読み上げ完了（または中断）まで待機。True=完了、False=タイムアウト"""
         return self._done.wait(timeout=timeout)
 
     def stop_current(self) -> None:
-        """即座に読み上げを中断する"""
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+        self._stop_flag.set()
+        # edge-tts 生成中ならプロセスを kill
         with self._proc_lock:
-            if self._proc and self._proc.poll() is None:
+            if self._gen_proc and self._gen_proc.poll() is None:
                 try:
-                    self._proc.terminate()
-                    log.info("TTS プロセスを終了しました")
+                    self._gen_proc.terminate()
+                    log.info("edge-tts 生成プロセスを終了しました")
                 except Exception:
                     pass
+        # MCI 再生中なら即停止
+        _mci("stop tts")
+        _mci("close tts")
         self._speaking.clear()
 
     def stop(self) -> None:
@@ -186,42 +221,92 @@ class TTSEngine:
             self._speak(text)
 
     def _speak(self, text: str) -> None:
-        safe = text.replace("'", "''")
-        ps_script = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            "$s.SelectVoice('Microsoft Haruka Desktop'); "
-            f"$s.Speak('{safe}')"
-        )
-        log.info(f"TTS 開始 ({len(text)} 文字)")
+        log.info(f"TTS 開始 ({len(text)} 文字, {_TTS_VOICE})")
         self._speaking.set()
+        self._stop_flag.clear()
+        tmp_mp3 = Path(__file__).parent / "_tts_output.mp3"
         try:
-            proc = subprocess.Popen(
-                ["powershell", "-NoProfile", "-Command", ps_script],
+            # ---- 1. edge-tts で MP3 生成 ----
+            python_exe = sys.executable or (
+                r"C:\Users\arai\AppData\Local\Programs\Python\Python313\pythonw.exe"
+            )
+            python_exe = python_exe.replace("pythonw.exe", "python.exe")
+            gen_proc = subprocess.Popen(
+                [
+                    python_exe, "-m", "edge_tts",
+                    "--voice", _TTS_VOICE,
+                    "--text", text,
+                    "--write-media", str(tmp_mp3),
+                ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
                 creationflags=_PS_FLAGS,
             )
             with self._proc_lock:
-                self._proc = proc
-            proc.wait(timeout=180)
-            rc = proc.returncode
-            if rc == 0:
-                log.info("TTS 完了")
+                self._gen_proc = gen_proc
+            gen_proc.wait(timeout=60)
+            with self._proc_lock:
+                self._gen_proc = None
+
+            if self._stop_flag.is_set():
+                log.info("TTS 中断（生成中にキャンセル）")
+                return
+            if gen_proc.returncode != 0:
+                stderr = gen_proc.stderr.read()[:300] if gen_proc.stderr else ""
+                log.error(f"edge-tts 生成失敗 rc={gen_proc.returncode}: {stderr}")
+                return
+            if not tmp_mp3.exists():
+                log.error("edge-tts: MP3 ファイルが生成されませんでした")
+                return
+
+            log.info(f"MP3 生成完了 ({tmp_mp3.stat().st_size} bytes)")
+
+            # ---- 2. Python から直接 MCI で MP3 再生 ----
+            mp3_path_str = str(tmp_mp3)
+            rc = _mci(f'open "{mp3_path_str}" type mpegvideo alias tts')
+            if rc != 0:
+                log.error(f"MCI open 失敗 rc={rc}")
+                return
+
+            rc = _mci("play tts")
+            if rc != 0:
+                log.error(f"MCI play 失敗 rc={rc}")
+                _mci("close tts")
+                return
+
+            # 再生完了をポーリングで待つ（stop_flag で即中断可能）
+            while not self._stop_flag.is_set():
+                status = _mci_status("status tts mode")
+                if status != "playing":
+                    break
+                time.sleep(0.1)
+
+            _mci("stop tts")
+            _mci("close tts")
+
+            if self._stop_flag.is_set():
+                log.info("TTS 中断（Esc/停止）")
             else:
-                stderr = proc.stderr.read()[:300] if proc.stderr else ""
-                log.error(f"TTS 異常終了 rc={rc} {stderr}")
+                log.info("TTS 完了")
+
         except subprocess.TimeoutExpired:
-            proc.terminate()
-            log.error("TTS タイムアウト (180秒)")
+            with self._proc_lock:
+                if self._gen_proc and self._gen_proc.poll() is None:
+                    self._gen_proc.terminate()
+                self._gen_proc = None
+            log.error("TTS タイムアウト（edge-tts 生成）")
         except Exception as e:
             log.error(f"TTS エラー: {e}")
         finally:
             with self._proc_lock:
-                self._proc = None
+                self._gen_proc = None
             self._speaking.clear()
-            self._done.set()  # 完了を通知
+            self._done.set()
+            try:
+                tmp_mp3.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 # =====================================================================
