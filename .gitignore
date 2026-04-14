@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+*.lnk
+create_startup.ps1
+setup_startup.ps1
