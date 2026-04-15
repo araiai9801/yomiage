@@ -16,13 +16,18 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import io
 import logging
+import math
 import os
 import queue
+import struct
 import subprocess
 import sys
 import threading
 import time
+import wave
+import winsound
 from pathlib import Path
 
 # ログ設定
@@ -68,6 +73,28 @@ _WM_USER          = 0x0400
 _HOTKEY_READ      = 1
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+
+
+# =====================================================================
+# ビープ音 WAV データ（メモリ上で生成）
+# =====================================================================
+def _make_beep_wav(freq: int = 1200, duration_ms: int = 80,
+                   volume: float = 0.3, sample_rate: int = 44100) -> bytes:
+    """指定周波数・長さのサイン波 WAV を bytes で返す"""
+    n_samples = int(sample_rate * duration_ms / 1000)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        for i in range(n_samples):
+            val = int(32767 * volume * math.sin(2 * math.pi * freq * i / sample_rate))
+            wf.writeframes(struct.pack("<h", val))
+    return buf.getvalue()
+
+
+_BEEP_WAV = _make_beep_wav(1200, 80, 0.3)   # 1200Hz, 80ms, 音量30%
+
 
 # クリップボード待ち時間
 _CLIP_WAIT_1 = 0.15   # 最初の待機 (秒)
@@ -247,7 +274,28 @@ class TTSEngine:
             )
             with self._proc_lock:
                 self._gen_proc = gen_proc
+
+            # 生成待ち中にビープ音を鳴らす（動作中であることを通知）
+            beep_stop = threading.Event()
+
+            def _beep_loop():
+                while not beep_stop.is_set():
+                    try:
+                        winsound.PlaySound(
+                            _BEEP_WAV,
+                            winsound.SND_MEMORY | winsound.SND_NOSTOP,
+                        )
+                    except Exception:
+                        pass
+                    beep_stop.wait(0.8)            # 0.8秒間隔
+
+            beep_thread = threading.Thread(target=_beep_loop, daemon=True)
+            beep_thread.start()
+
             gen_proc.wait(timeout=60)
+            beep_stop.set()
+            beep_thread.join(timeout=1)
+
             with self._proc_lock:
                 self._gen_proc = None
 
