@@ -129,6 +129,7 @@ def _send_ctrl_c() -> None:
 # =====================================================================
 # 音声名: ja-JP-NanamiNeural (女性), ja-JP-KeitaNeural (男性)
 _TTS_VOICE = "ja-JP-NanamiNeural"
+_TTS_RATE  = "+20%"   # 読み上げ速度 (例: "+10%", "+20%", "+50%", "-10%")
 
 
 
@@ -235,6 +236,7 @@ class TTSEngine:
                 [
                     python_exe, "-m", "edge_tts",
                     "--voice", _TTS_VOICE,
+                    "--rate", _TTS_RATE,
                     "--text", text,
                     "--write-media", str(tmp_mp3),
                 ],
