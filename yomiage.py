@@ -187,6 +187,57 @@ def _mci_status(cmd: str) -> str:
     return buf.value
 
 
+import re as _re
+
+# 文の区切りパターン（日本語の句点・感嘆符・疑問符・改行など）
+_SENTENCE_SPLIT = _re.compile(r'(?<=[。！？!?\n])\s*')
+
+# 1チャンクの最大文字数（これ以上は強制分割）
+_CHUNK_MAX_CHARS = 120
+
+
+def _split_into_chunks(text: str) -> list[str]:
+    """テキストを文単位のチャンクに分割する"""
+    # まず文で分割
+    sentences = _SENTENCE_SPLIT.split(text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        return [text.strip()] if text.strip() else []
+
+    # 短い文はまとめる、長い文は分割
+    chunks: list[str] = []
+    current = ""
+    for s in sentences:
+        if len(s) > _CHUNK_MAX_CHARS:
+            # 長い文: 現在のバッファを先にフラッシュ
+            if current:
+                chunks.append(current)
+                current = ""
+            # 句読点なしの長文は読点で分割を試みる
+            parts = _re.split(r'(?<=[、,，])\s*', s)
+            sub = ""
+            for p in parts:
+                if len(sub) + len(p) > _CHUNK_MAX_CHARS and sub:
+                    chunks.append(sub)
+                    sub = p
+                else:
+                    sub += p
+            if sub:
+                chunks.append(sub)
+        elif len(current) + len(s) > _CHUNK_MAX_CHARS:
+            # バッファがいっぱい → フラッシュ
+            if current:
+                chunks.append(current)
+            current = s
+        else:
+            current += s
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [text.strip()]
+
+
 class TTSEngine:
     def __init__(self):
         self._queue: queue.Queue[str | None] = queue.Queue()
@@ -196,8 +247,17 @@ class TTSEngine:
         self._stop_flag = threading.Event()
         self._done = threading.Event()
         self._done.set()
+        self._python_exe: str | None = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
+
+    def _get_python_exe(self) -> str:
+        if self._python_exe is None:
+            exe = sys.executable or (
+                r"C:\Users\arai\AppData\Local\Programs\Python\Python313\pythonw.exe"
+            )
+            self._python_exe = exe.replace("pythonw.exe", "python.exe")
+        return self._python_exe
 
     @property
     def is_speaking(self) -> bool:
@@ -248,104 +308,134 @@ class TTSEngine:
                 break
             self._speak(text)
 
-    def _speak(self, text: str) -> None:
-        log.info(f"TTS 開始 ({len(text)} 文字, {_TTS_VOICE})")
-        self._speaking.set()
-        self._stop_flag.clear()
-        tmp_mp3 = Path(__file__).parent / "_tts_output.mp3"
+    def _generate_mp3(self, text: str, mp3_path: Path) -> bool:
+        """edge-tts で MP3 を生成。成功なら True"""
+        proc = subprocess.Popen(
+            [
+                self._get_python_exe(), "-m", "edge_tts",
+                "--voice", _TTS_VOICE,
+                "--rate", _TTS_RATE,
+                "--text", text,
+                "--write-media", str(mp3_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=_PS_FLAGS,
+        )
+        with self._proc_lock:
+            self._gen_proc = proc
         try:
-            # ---- 1. edge-tts で MP3 生成 ----
-            python_exe = sys.executable or (
-                r"C:\Users\arai\AppData\Local\Programs\Python\Python313\pythonw.exe"
-            )
-            python_exe = python_exe.replace("pythonw.exe", "python.exe")
-            gen_proc = subprocess.Popen(
-                [
-                    python_exe, "-m", "edge_tts",
-                    "--voice", _TTS_VOICE,
-                    "--rate", _TTS_RATE,
-                    "--text", text,
-                    "--write-media", str(tmp_mp3),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=_PS_FLAGS,
-            )
-            with self._proc_lock:
-                self._gen_proc = gen_proc
-
-            # 生成待ち中にビープ音を鳴らす（動作中であることを通知）
-            beep_stop = threading.Event()
-
-            def _beep_loop():
-                while not beep_stop.is_set():
-                    try:
-                        winsound.PlaySound(
-                            _BEEP_WAV,
-                            winsound.SND_MEMORY | winsound.SND_NOSTOP,
-                        )
-                    except Exception:
-                        pass
-                    beep_stop.wait(0.8)            # 0.8秒間隔
-
-            beep_thread = threading.Thread(target=_beep_loop, daemon=True)
-            beep_thread.start()
-
-            gen_proc.wait(timeout=60)
-            beep_stop.set()
-            beep_thread.join(timeout=1)
-
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            return False
+        finally:
             with self._proc_lock:
                 self._gen_proc = None
+        if proc.returncode != 0:
+            stderr = proc.stderr.read()[:300] if proc.stderr else ""
+            log.error(f"edge-tts 生成失敗 rc={proc.returncode}: {stderr}")
+            return False
+        return mp3_path.exists()
 
-            if self._stop_flag.is_set():
-                log.info("TTS 中断（生成中にキャンセル）")
-                return
-            if gen_proc.returncode != 0:
-                stderr = gen_proc.stderr.read()[:300] if gen_proc.stderr else ""
-                log.error(f"edge-tts 生成失敗 rc={gen_proc.returncode}: {stderr}")
-                return
-            if not tmp_mp3.exists():
-                log.error("edge-tts: MP3 ファイルが生成されませんでした")
-                return
-
-            log.info(f"MP3 生成完了 ({tmp_mp3.stat().st_size} bytes)")
-
-            # ---- 2. Python から直接 MCI で MP3 再生 ----
-            mp3_path_str = str(tmp_mp3)
-            rc = _mci(f'open "{mp3_path_str}" type mpegvideo alias tts')
-            if rc != 0:
-                log.error(f"MCI open 失敗 rc={rc}")
-                return
-
-            rc = _mci("play tts")
-            if rc != 0:
-                log.error(f"MCI play 失敗 rc={rc}")
-                _mci("close tts")
-                return
-
-            # 再生完了をポーリングで待つ（stop_flag で即中断可能）
-            while not self._stop_flag.is_set():
-                status = _mci_status("status tts mode")
-                if status != "playing":
-                    break
-                time.sleep(0.1)
-
-            _mci("stop tts")
+    def _play_mp3(self, mp3_path: Path) -> None:
+        """MCI で MP3 を再生し、完了 or stop_flag まで待つ"""
+        mp3_path_str = str(mp3_path)
+        rc = _mci(f'open "{mp3_path_str}" type mpegvideo alias tts')
+        if rc != 0:
+            log.error(f"MCI open 失敗 rc={rc}")
+            return
+        rc = _mci("play tts")
+        if rc != 0:
+            log.error(f"MCI play 失敗 rc={rc}")
             _mci("close tts")
+            return
+        # 再生完了をポーリングで待つ
+        while not self._stop_flag.is_set():
+            status = _mci_status("status tts mode")
+            if status != "playing":
+                break
+            time.sleep(0.1)
+        _mci("stop tts")
+        _mci("close tts")
 
-            if self._stop_flag.is_set():
-                log.info("TTS 中断（Esc/停止）")
+    def _speak(self, text: str) -> None:
+        chunks = _split_into_chunks(text)
+        log.info(f"TTS 開始 ({len(text)} 文字, {len(chunks)} チャンク, {_TTS_VOICE})")
+        self._speaking.set()
+        self._stop_flag.clear()
+
+        tmp_dir = Path(__file__).parent
+        generated_files: list[Path] = []
+
+        try:
+            for i, chunk in enumerate(chunks):
+                if self._stop_flag.is_set():
+                    log.info("TTS 中断")
+                    break
+
+                mp3_file = tmp_dir / f"_tts_chunk_{i}.mp3"
+                generated_files.append(mp3_file)
+
+                # ---- 先読み生成スレッド（次のチャンクを並行生成） ----
+                next_mp3: Path | None = None
+                prefetch_thread: threading.Thread | None = None
+                prefetch_ok: list[bool] = [False]
+
+                if i + 1 < len(chunks):
+                    next_mp3 = tmp_dir / f"_tts_chunk_{i + 1}.mp3"
+                    generated_files.append(next_mp3)
+
+                    def _prefetch(txt=chunks[i + 1], path=next_mp3):
+                        prefetch_ok[0] = self._generate_mp3(txt, path)
+
+                # ---- 現在のチャンクを生成 ----
+                if i == 0:
+                    # 最初のチャンクだけビープ音付き
+                    beep_stop = threading.Event()
+
+                    def _beep_loop():
+                        while not beep_stop.is_set():
+                            try:
+                                winsound.PlaySound(
+                                    _BEEP_WAV,
+                                    winsound.SND_MEMORY | winsound.SND_NOSTOP,
+                                )
+                            except Exception:
+                                pass
+                            beep_stop.wait(0.8)
+
+                    beep_thread = threading.Thread(target=_beep_loop, daemon=True)
+                    beep_thread.start()
+                    ok = self._generate_mp3(chunk, mp3_file)
+                    beep_stop.set()
+                    beep_thread.join(timeout=1)
+                else:
+                    ok = self._generate_mp3(chunk, mp3_file)
+
+                if not ok or self._stop_flag.is_set():
+                    break
+
+                log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
+
+                # 再生開始と同時に次のチャンクを先読み生成
+                if next_mp3 is not None:
+                    prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
+                    prefetch_thread.start()
+
+                self._play_mp3(mp3_file)
+
+                # 先読み完了を待つ
+                if prefetch_thread is not None:
+                    prefetch_thread.join(timeout=60)
+
+                if self._stop_flag.is_set():
+                    log.info("TTS 中断（Esc/停止）")
+                    break
             else:
                 log.info("TTS 完了")
 
-        except subprocess.TimeoutExpired:
-            with self._proc_lock:
-                if self._gen_proc and self._gen_proc.poll() is None:
-                    self._gen_proc.terminate()
-                self._gen_proc = None
-            log.error("TTS タイムアウト（edge-tts 生成）")
         except Exception as e:
             log.error(f"TTS エラー: {e}")
         finally:
@@ -353,10 +443,12 @@ class TTSEngine:
                 self._gen_proc = None
             self._speaking.clear()
             self._done.set()
-            try:
-                tmp_mp3.unlink(missing_ok=True)
-            except Exception:
-                pass
+            # 一時ファイル削除
+            for f in generated_files:
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 # =====================================================================
