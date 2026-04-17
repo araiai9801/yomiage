@@ -1,44 +1,168 @@
 # yomiage — 選択テキスト読み上げアプリ
 
-Windows 上でテキストを選択してホットキーを押すと、日本語音声で読み上げるシステムトレイ常駐アプリ。
+Windows 上でテキストを選択してホットキーを押すだけで、日本語音声で読み上げてくれるシステムトレイ常駐アプリです。
+ブラウザ、メモ帳、Word、PDF ビューアなど、コピーできるテキストならどこでも使えます。
 
-## 機能
+---
 
-- **Ctrl+Alt+R** : 選択テキストを日本語音声（Microsoft Nanami Neural）で読み上げ
-- **Esc** : 読み上げを即座に停止（読み上げ中のみ有効）
-- **Ctrl+Alt+R 再押し** : 読み上げ中なら停止
-- システムトレイアイコンから停止・終了
+## 主な機能
 
-## 必要環境
+| ホットキー | 動作 |
+| ---------- | ---- |
+| **Ctrl + Alt + R** | 選択中のテキストを読み上げ（もう一度押すと停止） |
+| **Ctrl + Alt + E** | カーソル位置から文末までを読み上げ |
+| **Esc**            | 読み上げ中に押すと即座に停止 |
 
-- Windows 10/11
-- Python 3.10+
-- インターネット接続（edge-tts による音声合成に必要）
+- 画面下部に「読み上げ中の文」を常時最前面で表示するオーバーレイ付き（Web ページが勝手にスクロールしても今どこを読んでいるか一目で分かります）
+- MP3 生成中は柔らかいビープ音で動作中であることを通知
+- 長文でも文単位にチャンク分割し、先頭から順次再生（最初の一文が生成できた時点で読み始めます）
+- タスクトレイアイコン「読」から停止・終了が可能
 
-## インストール
+---
 
-```bash
+## 動作環境
+
+- Windows 10 / 11 (64bit)
+- Python 3.10 以上（3.13 で動作確認）
+- インターネット接続（Microsoft edge-tts による音声合成に必須）
+
+---
+
+## インストール手順（初めての方向け）
+
+### 手順 1. Python をインストールする
+
+1. [https://www.python.org/downloads/windows/](https://www.python.org/downloads/windows/) から Python 3.10 以上のインストーラをダウンロード
+2. インストーラ起動時、**「Add python.exe to PATH」 にチェックを入れて** 「Install Now」 をクリック
+3. インストール後、コマンドプロンプトを開いて確認:
+
+   ```cmd
+   python --version
+   ```
+
+   `Python 3.13.x` のように表示されれば OK。
+
+### 手順 2. 本リポジトリを取得する
+
+Git がある場合:
+
+```cmd
+git clone https://github.com/araiai9801/yomiage.git
+cd yomiage
+```
+
+Git が無い場合は GitHub の `Code → Download ZIP` で ZIP をダウンロードし、任意の場所に展開してください（例: `C:\Users\<あなた>\yomiage`）。
+
+### 手順 3. 必要ライブラリをインストール
+
+コマンドプロンプト（または PowerShell）でフォルダに入り、以下を実行:
+
+```cmd
 pip install pystray pyperclip pillow edge-tts
 ```
 
-## 起動方法
+tkinter は Python 標準付属なので追加インストール不要です。
 
-バッチファイルをダブルクリック:
+### 手順 4. 起動用バッチのパスを自分の環境に合わせる（重要）
 
-```
-yomiage.bat
-```
+`yomiage.bat` をメモ帳で開き、12 行目の 2 つのパスを **自分の環境に合わせて書き換えてください**:
 
-または直接実行:
-
-```bash
-pythonw yomiage.py
+```bat
+start "" "C:\Users\arai\AppData\Local\Programs\Python\Python313\pythonw.exe" "C:\Users\arai\OneDrive\ドキュメント\code\ClaudeCode\yomiage\yomiage.py"
 ```
 
-## 仕組み
+- 1 つ目: `pythonw.exe` のフルパス
+  - 通常は `C:\Users\<あなた>\AppData\Local\Programs\Python\Python3XX\pythonw.exe`
+  - 分からない場合はコマンドプロンプトで `where pythonw` を実行
+- 2 つ目: `yomiage.py` のフルパス（手順 2 で展開した場所）
 
-1. `RegisterHotKey` API でグローバルホットキー（Ctrl+Alt+R）を登録
-2. ホットキー検出 → `SendInput` で Ctrl+C を送信して選択テキストをクリップボードにコピー
-3. `edge-tts` で Microsoft Nanami Neural 音声の MP3 を生成
-4. `winmm.dll` MCI API で MP3 を直接再生（PowerShell 不要）
-5. 読み上げ中は Esc キーを動的に登録し、即座に中断可能
+> PowerShell スクリプト（`register_context_menu.ps1`, `setup_startup.ps1`）の中にも同じパスがあります。使う場合は合わせて書き換えてください。
+
+### 手順 5. 起動する
+
+`yomiage.bat` をダブルクリック。
+タスクトレイ（画面右下の時計の近く）に **「読」** というアイコンが出れば起動成功です。
+
+---
+
+## 使い方
+
+1. ブラウザでも Word でも、読み上げたいテキストをマウスで選択
+2. **Ctrl + Alt + R** を押す
+3. 画面下部に「読み上げ中」オーバーレイが出て、日本語音声で読み上げが始まります
+4. 途中で止めたいときは **Esc** か **Ctrl + Alt + R** をもう一度
+
+**カーソル位置から最後まで読む**（長い Web 記事を途中から聴きたいとき便利）:
+テキスト中の任意の場所をクリックしてカーソルを置き、**Ctrl + Alt + E** を押します。
+
+**終了するには:**
+タスクトレイの「読」アイコンを右クリック → 「終了」
+
+---
+
+## （任意）便利設定
+
+### A. Windows 起動時に自動起動
+
+PowerShell を **管理者として実行** し、本フォルダで:
+
+```powershell
+.\setup_startup.ps1
+```
+
+ログオン 30 秒後に自動起動するタスクが登録されます。
+解除したいときはタスクスケジューラで `yomiage` タスクを削除してください。
+
+### B. デスクトップ右クリックメニューから起動
+
+PowerShell を **管理者として実行** し:
+
+```powershell
+.\register_context_menu.ps1
+```
+
+デスクトップや任意のフォルダの空白を右クリック → 「読み上げアプリを起動」 が追加されます。
+解除は `.\unregister_context_menu.ps1` を実行。
+
+---
+
+## トラブルシューティング
+
+| 症状 | 原因・対処 |
+| ---- | ---------- |
+| トレイアイコンが出ない | コマンドプロンプトで `python yomiage.py` と実行してエラーを確認。多くは `pip install` 不足 |
+| `ModuleNotFoundError: pystray` など | 手順 3 の `pip install` をやり直す |
+| 音が出ない | Windows の音量・既定の再生デバイスを確認。機内モード時は edge-tts が失敗します |
+| 「音声を取得できませんでした」と表示 | ネット接続 / プロキシ / ファイアウォール設定を確認 |
+| Ctrl+Alt+R が効かない | 他のアプリ（OBS など）が同じキーを登録している可能性。競合アプリを終了 |
+| Ctrl+Alt+E を押しても読まれない | 対象アプリが Ctrl+Shift+End 選択に対応していないケース。ブラウザ・メモ帳・Word では動作します |
+| 読み上げが途中で止まる | 長文は文単位で分割して再生。ネット断などで途切れた場合は Esc → 選び直し |
+
+ログは `yomiage.log` に出力されます。問題報告の際に添付してください。
+
+---
+
+## アンインストール
+
+1. 読み上げアプリを終了（トレイ → 終了）
+2. タスクスケジューラ登録済みなら `yomiage` タスクを削除
+3. 右クリックメニュー登録済みなら `unregister_context_menu.ps1` を実行
+4. フォルダごと削除
+
+---
+
+## 仕組み（開発者向けメモ）
+
+1. `RegisterHotKey` Win32 API でグローバルホットキー（Ctrl+Alt+R / Ctrl+Alt+E）を登録
+2. ホットキー検出時、`SendInput` で Ctrl+C（または Ctrl+Shift+End → Ctrl+C）を送信し、選択テキストをクリップボードへ
+3. `edge-tts` で Microsoft Nanami Neural 音声の MP3 を生成（文単位のチャンク、プリフェッチ並列化）
+4. `winmm.dll` の MCI API で MP3 を直接再生（PowerShell 不要）
+5. 再生中は Esc キーを動的に登録し、即座に中断可能
+6. tkinter で常時最前面のオーバーレイを別スレッド表示
+
+---
+
+## ライセンス / 免責
+
+個人利用・学習目的での配布自由。edge-tts は Microsoft Edge の読み上げ機能を利用しており、Microsoft の利用規約に従って使用してください。
+音声合成にはインターネット経由で Microsoft サーバへテキストが送信されます。機密情報の読み上げ用途にはご注意ください。

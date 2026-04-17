@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 import wave
 import winsound
 from pathlib import Path
@@ -204,6 +205,83 @@ def _send_ctrl_shift_end_then_copy() -> None:
 
 
 # =====================================================================
+# OverlayWindow — 読み上げ中のテキストを画面下部に表示
+# =====================================================================
+class OverlayWindow:
+    """読み上げ中のチャンクを画面下部に表示する常に最前面のオーバーレイ"""
+
+    def __init__(self):
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        root = tk.Tk()
+        root.withdraw()
+        root.overrideredirect(True)       # タイトルバーなし
+        root.attributes("-topmost", True)
+        root.attributes("-alpha", 0.88)
+        root.configure(bg="#1a1a1a")
+
+        # 画面下部中央に配置
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
+        w, h = min(1000, screen_w - 100), 120
+        x = (screen_w - w) // 2
+        y = screen_h - h - 80
+        root.geometry(f"{w}x{h}+{x}+{y}")
+
+        # タイトル行
+        title_lbl = tk.Label(
+            root, text="", font=("Meiryo", 10),
+            fg="#88ccff", bg="#1a1a1a", anchor="w",
+        )
+        title_lbl.pack(fill="x", padx=15, pady=(8, 0))
+
+        # 本文
+        text_lbl = tk.Label(
+            root, text="", font=("Meiryo", 16, "bold"),
+            fg="#ffffff", bg="#1a1a1a", wraplength=w - 30,
+            justify="left", anchor="w",
+        )
+        text_lbl.pack(expand=True, fill="both", padx=15, pady=(4, 10))
+
+        def poll():
+            try:
+                while True:
+                    msg = self._queue.get_nowait()
+                    if msg is None:
+                        root.destroy()
+                        return
+                    action, a, b = msg
+                    if action == "show":
+                        title_lbl.config(text=a)
+                        text_lbl.config(text=b)
+                        root.deiconify()
+                        root.lift()
+                    elif action == "update":
+                        title_lbl.config(text=a)
+                        text_lbl.config(text=b)
+                    elif action == "hide":
+                        root.withdraw()
+            except queue.Empty:
+                pass
+            root.after(50, poll)
+
+        root.after(50, poll)
+        root.mainloop()
+
+    def show(self, title: str, text: str) -> None:
+        self._queue.put(("show", title, text))
+
+    def update(self, title: str, text: str) -> None:
+        self._queue.put(("update", title, text))
+
+    def hide(self) -> None:
+        self._queue.put(("hide", "", ""))
+
+
+# =====================================================================
 # TTSEngine — edge-tts (Microsoft Nanami) + 即座に中断可能
 # =====================================================================
 # 音声名: ja-JP-NanamiNeural (女性), ja-JP-KeitaNeural (男性)
@@ -291,7 +369,8 @@ def _split_into_chunks(text: str) -> list[str]:
 
 
 class TTSEngine:
-    def __init__(self):
+    def __init__(self, overlay: OverlayWindow | None = None):
+        self._overlay = overlay
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._gen_proc: subprocess.Popen | None = None
         self._proc_lock = threading.Lock()
@@ -471,6 +550,14 @@ class TTSEngine:
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
+                # オーバーレイを更新（現在のチャンクを表示）
+                if self._overlay is not None:
+                    title = f"読み上げ中 {i+1}/{len(chunks)}"
+                    if i == 0:
+                        self._overlay.show(title, chunk)
+                    else:
+                        self._overlay.update(title, chunk)
+
                 # 再生開始と同時に次のチャンクを先読み生成
                 if next_mp3 is not None:
                     prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
@@ -495,6 +582,9 @@ class TTSEngine:
                 self._gen_proc = None
             self._speaking.clear()
             self._done.set()
+            # オーバーレイを隠す
+            if self._overlay is not None:
+                self._overlay.hide()
             # 一時ファイル削除
             for f in generated_files:
                 try:
@@ -765,7 +855,8 @@ if __name__ == "__main__":
     try:
         log.info(f"=== yomiage 起動 (Python {sys.version}) ===")
         log.info(f"スクリプト: {__file__}")
-        tts = TTSEngine()
+        overlay = OverlayWindow()
+        tts = TTSEngine(overlay)
         clipboard = ClipboardManager()
         hotkey = HotkeyHandler(tts, clipboard)
         app = TrayApp(tts, hotkey)
