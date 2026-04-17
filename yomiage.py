@@ -9,6 +9,7 @@ yomiage.py — 選択テキスト読み上げアプリ
 
 ホットキー:
   Ctrl+Alt+R : 選択テキストを読み上げ（読み上げ中なら停止）
+  Ctrl+Alt+E : テキストカーソル位置から文末まで読み上げ
   Esc        : 読み上げ中のみ有効。読み上げを即座に停止。
 """
 
@@ -61,6 +62,8 @@ _KEYEVENTF_KEYUP  = 0x0002
 _VK_CONTROL       = 0x11
 _VK_C             = 0x43
 _VK_R             = 0x52
+_VK_E             = 0x45
+_VK_END           = 0x23
 _VK_ESCAPE        = 0x1B
 
 _MOD_ALT          = 0x0001
@@ -71,6 +74,7 @@ _WM_HOTKEY        = 0x0312
 _WM_USER          = 0x0400
 
 _HOTKEY_READ      = 1
+_HOTKEY_READ_END  = 3   # Ctrl+Alt+E
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -78,22 +82,30 @@ _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 # =====================================================================
 # ビープ音 WAV データ（メモリ上で生成）
 # =====================================================================
-def _make_beep_wav(freq: int = 1200, duration_ms: int = 80,
-                   volume: float = 0.3, sample_rate: int = 44100) -> bytes:
-    """指定周波数・長さのサイン波 WAV を bytes で返す"""
+def _make_beep_wav(freq: int = 800, duration_ms: int = 150,
+                   volume: float = 0.15, sample_rate: int = 44100) -> bytes:
+    """フェードイン/アウト付きサイン波 WAV を bytes で返す（柔らかい音）"""
     n_samples = int(sample_rate * duration_ms / 1000)
+    fade = int(n_samples * 0.25)   # 前後25%をフェード
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)  # 16-bit
         wf.setframerate(sample_rate)
         for i in range(n_samples):
-            val = int(32767 * volume * math.sin(2 * math.pi * freq * i / sample_rate))
+            # フェードエンベロープ
+            if i < fade:
+                env = i / fade
+            elif i > n_samples - fade:
+                env = (n_samples - i) / fade
+            else:
+                env = 1.0
+            val = int(32767 * volume * env * math.sin(2 * math.pi * freq * i / sample_rate))
             wf.writeframes(struct.pack("<h", val))
     return buf.getvalue()
 
 
-_BEEP_WAV = _make_beep_wav(1200, 80, 0.3)   # 1200Hz, 80ms, 音量30%
+_BEEP_WAV = _make_beep_wav(800, 60, 0.15)   # 800Hz, 60ms, 音量15%, フェード付き
 
 
 # クリップボード待ち時間
@@ -129,10 +141,8 @@ _VK_MENU    = 0x12   # Alt
 _VK_SHIFT   = 0x10
 
 
-def _send_ctrl_c() -> None:
-    # まず修飾キー (Ctrl, Alt, Shift) をすべてリリースする。
-    # ホットキー Ctrl+Alt+R の直後はこれらが押下状態のままなので、
-    # そのまま Ctrl+C を送ると Ctrl+Alt+C になりコピーが効かない。
+def _release_modifiers() -> None:
+    """修飾キー (Ctrl/Alt/Shift) をすべてリリースする"""
     release = (_INPUT * 3)(
         _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
         _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_MENU,    0, _KEYEVENTF_KEYUP, 0, None))),
@@ -141,14 +151,41 @@ def _send_ctrl_c() -> None:
     ctypes.windll.user32.SendInput(3, release, ctypes.sizeof(_INPUT))
     time.sleep(0.05)
 
-    # Ctrl+C を送信
+
+def _send_ctrl_c() -> None:
+    """修飾キーをリリースしてから Ctrl+C を送信"""
+    _release_modifiers()
     inputs = (_INPUT * 4)(
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,               0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, 0,               0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, 0,                0, None))),
         _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, _KEYEVENTF_KEYUP, 0, None))),
         _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
     )
     ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(_INPUT))
+
+
+def _send_ctrl_shift_end_then_copy() -> None:
+    """Ctrl+Shift+End で末尾まで選択してから Ctrl+C でコピー"""
+    _release_modifiers()
+    # Step1: Ctrl+Shift+End で選択
+    sel = (_INPUT * 6)(
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_SHIFT,   0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_END,     0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_END,     0, _KEYEVENTF_KEYUP, 0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_SHIFT,   0, _KEYEVENTF_KEYUP, 0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
+    )
+    ctypes.windll.user32.SendInput(6, sel, ctypes.sizeof(_INPUT))
+    time.sleep(0.05)
+    # Step2: Ctrl+C でコピー
+    copy = (_INPUT * 4)(
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, 0,                0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, _KEYEVENTF_KEYUP, 0, None))),
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
+    )
+    ctypes.windll.user32.SendInput(4, copy, ctypes.sizeof(_INPUT))
 
 
 # =====================================================================
@@ -456,38 +493,31 @@ class TTSEngine:
 # =====================================================================
 class ClipboardManager:
 
-    def get_selected_text(self) -> str:
-        """選択テキストを取得する。失敗時は空文字列を返す。"""
+    def _copy_and_read(self, send_fn) -> str:
+        """send_fn でキー送信 → クリップボード読み取り → 元のクリップボードを復元"""
         original = self._read()
-
-        # クリップボードをクリアしてから Ctrl+C
         self._clear()
-        _send_ctrl_c()
+        send_fn()
         time.sleep(_CLIP_WAIT_1)
-
         text = self._read()
         if not text.strip():
-            # リトライ: アプリによっては遅い
             time.sleep(_CLIP_WAIT_2)
             text = self._read()
-
-        # 元のクリップボードを復元（新テキストが取れた場合のみ）
-        if text.strip():
-            # 取得成功 → 元のクリップボードを復元
-            if original and original != text:
-                try:
-                    pyperclip.copy(original)
-                except Exception:
-                    pass
-        else:
-            # 取得失敗 → 元のクリップボードを復元
-            if original:
-                try:
-                    pyperclip.copy(original)
-                except Exception:
-                    pass
-
+        # 元のクリップボードを復元
+        if original and original != text:
+            try:
+                pyperclip.copy(original)
+            except Exception:
+                pass
         return text.strip()
+
+    def get_selected_text(self) -> str:
+        """選択テキストを取得する。失敗時は空文字列を返す。"""
+        return self._copy_and_read(_send_ctrl_c)
+
+    def get_text_from_cursor(self) -> str:
+        """テキストカーソル位置から文末までを取得する。失敗時は空文字列を返す。"""
+        return self._copy_and_read(_send_ctrl_shift_end_then_copy)
 
     def _read(self) -> str:
         try:
@@ -544,6 +574,12 @@ class HotkeyHandler:
             return
         log.info("Ctrl+Alt+R を登録しました")
 
+        ok2 = user32.RegisterHotKey(None, _HOTKEY_READ_END, _MOD_CTRL_ALT, _VK_E)
+        if ok2:
+            log.info("Ctrl+Alt+E を登録しました（カーソル位置から末尾まで読み上げ）")
+        else:
+            log.warning("RegisterHotKey(Ctrl+Alt+E) 失敗（他アプリが使用中の可能性）")
+
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == _WM_HOTKEY:
@@ -553,9 +589,19 @@ class HotkeyHandler:
                         self._tts.stop_current()
                         self._do_unregister_esc(user32)
                     else:
-                        log.info("Ctrl+Alt+R → 読み上げ開始")
+                        log.info("Ctrl+Alt+R → 読み上げ開始（選択テキスト）")
                         t = threading.Thread(
                             target=self._speak_selected_text, daemon=True)
+                        t.start()
+                elif msg.wParam == _HOTKEY_READ_END:
+                    if self._tts.is_speaking:
+                        log.info("Ctrl+Alt+E → 読み上げ停止")
+                        self._tts.stop_current()
+                        self._do_unregister_esc(user32)
+                    else:
+                        log.info("Ctrl+Alt+E → 読み上げ開始（カーソル位置から末尾）")
+                        t = threading.Thread(
+                            target=self._speak_from_cursor, daemon=True)
                         t.start()
                 elif msg.wParam == _HOTKEY_ESC:
                     log.info("Esc → 読み上げ停止")
@@ -568,6 +614,7 @@ class HotkeyHandler:
                 self._do_unregister_esc(user32)
 
         user32.UnregisterHotKey(None, _HOTKEY_READ)
+        user32.UnregisterHotKey(None, _HOTKEY_READ_END)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
 
@@ -589,17 +636,33 @@ class HotkeyHandler:
         if not self._lock.acquire(blocking=False):
             return
         try:
-            # ユーザーが Ctrl+Alt+R のキーを離すのを待つ
-            time.sleep(0.3)
+            time.sleep(0.3)  # キーを離すのを待つ
             text = self._clipboard.get_selected_text()
             if text:
                 log.info(f"読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
                 self._tts.speak(text)
-                self._tts.wait_done()  # 読み上げ完了 or 中断まで待機
+                self._tts.wait_done()
                 self._unregister_esc()
             else:
                 log.info("テキストが取得できませんでした")
+        finally:
+            self._lock.release()
+
+    def _speak_from_cursor(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            time.sleep(0.3)  # キーを離すのを待つ
+            text = self._clipboard.get_text_from_cursor()
+            if text:
+                log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
+                self._register_esc()
+                self._tts.speak(text)
+                self._tts.wait_done()
+                self._unregister_esc()
+            else:
+                log.info("カーソル位置からテキストが取得できませんでした")
         finally:
             self._lock.release()
 
@@ -617,7 +680,9 @@ class TrayApp:
             pystray.MenuItem("終了", self._on_quit),
         )
         self._icon = pystray.Icon(
-            "yomiage", img, "読み上げ  Ctrl+Alt+R  /  Esc で停止", menu,
+            "yomiage", img,
+            "読み上げ  Ctrl+Alt+R(選択) / Ctrl+Alt+E(末尾まで) / Esc で停止",
+            menu,
         )
 
     def _create_icon_image(self) -> Image.Image:
