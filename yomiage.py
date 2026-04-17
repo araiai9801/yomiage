@@ -58,7 +58,8 @@ except Exception:
 # Windows 定数
 # =====================================================================
 _INPUT_KEYBOARD   = 1
-_KEYEVENTF_KEYUP  = 0x0002
+_KEYEVENTF_KEYUP       = 0x0002
+_KEYEVENTF_EXTENDEDKEY = 0x0001
 _VK_CONTROL       = 0x11
 _VK_C             = 0x43
 _VK_R             = 0x52
@@ -164,28 +165,42 @@ def _send_ctrl_c() -> None:
     ctypes.windll.user32.SendInput(4, inputs, ctypes.sizeof(_INPUT))
 
 
+def _send_one_key(vk: int, flags: int = 0) -> None:
+    inp = (_INPUT * 1)(
+        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(vk, 0, flags, 0, None))),
+    )
+    ctypes.windll.user32.SendInput(1, inp, ctypes.sizeof(_INPUT))
+
+
 def _send_ctrl_shift_end_then_copy() -> None:
-    """Ctrl+Shift+End で末尾まで選択してから Ctrl+C でコピー"""
+    """Ctrl+Shift+End で選択 → Ctrl+C でコピー（End は拡張キーとして送信）"""
     _release_modifiers()
-    # Step1: Ctrl+Shift+End で選択
-    sel = (_INPUT * 6)(
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,                0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_SHIFT,   0, 0,                0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_END,     0, 0,                0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_END,     0, _KEYEVENTF_KEYUP, 0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_SHIFT,   0, _KEYEVENTF_KEYUP, 0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
-    )
-    ctypes.windll.user32.SendInput(6, sel, ctypes.sizeof(_INPUT))
-    time.sleep(0.05)
+
+    # Step1: Ctrl+Shift+End（End は KEYEVENTF_EXTENDEDKEY が必要）
+    _send_one_key(_VK_CONTROL, 0)
+    time.sleep(0.02)
+    _send_one_key(_VK_SHIFT, 0)
+    time.sleep(0.02)
+    _send_one_key(_VK_END, _KEYEVENTF_EXTENDEDKEY)                       # End down (拡張)
+    time.sleep(0.02)
+    _send_one_key(_VK_END, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)    # End up (拡張)
+    time.sleep(0.02)
+    _send_one_key(_VK_SHIFT, _KEYEVENTF_KEYUP)
+    time.sleep(0.02)
+    _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
+
+    # 選択確定を待つ
+    time.sleep(0.25)
+
     # Step2: Ctrl+C でコピー
-    copy = (_INPUT * 4)(
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, 0,                0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, 0,                0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_C,       0, _KEYEVENTF_KEYUP, 0, None))),
-        _INPUT(_INPUT_KEYBOARD, _InputUnion(ki=_KeyBdInput(_VK_CONTROL, 0, _KEYEVENTF_KEYUP, 0, None))),
-    )
-    ctypes.windll.user32.SendInput(4, copy, ctypes.sizeof(_INPUT))
+    log.info("Ctrl+C 送信開始")
+    _send_one_key(_VK_CONTROL, 0)
+    time.sleep(0.02)
+    _send_one_key(_VK_C, 0)
+    time.sleep(0.02)
+    _send_one_key(_VK_C, _KEYEVENTF_KEYUP)
+    time.sleep(0.02)
+    _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
 
 
 # =====================================================================
@@ -517,7 +532,23 @@ class ClipboardManager:
 
     def get_text_from_cursor(self) -> str:
         """テキストカーソル位置から文末までを取得する。失敗時は空文字列を返す。"""
-        return self._copy_and_read(_send_ctrl_shift_end_then_copy)
+        original = self._read()
+        self._clear()
+        _send_ctrl_shift_end_then_copy()
+        # 選択+コピー後はクリップボード更新が遅いアプリがあるため長めに待つ
+        time.sleep(0.25)
+        text = self._read()
+        if not text.strip():
+            time.sleep(0.3)
+            text = self._read()
+        # 元のクリップボードを復元
+        if original and original != text:
+            try:
+                pyperclip.copy(original)
+            except Exception:
+                pass
+        log.info(f"カーソルから取得: {len(text)} 文字")
+        return text.strip()
 
     def _read(self) -> str:
         try:
@@ -599,9 +630,10 @@ class HotkeyHandler:
                         self._tts.stop_current()
                         self._do_unregister_esc(user32)
                     else:
-                        log.info("Ctrl+Alt+E → 読み上げ開始（カーソル位置から末尾）")
+                        hwnd = user32.GetForegroundWindow()
+                        log.info(f"Ctrl+Alt+E → 読み上げ開始（カーソル位置から末尾, hwnd={hwnd}）")
                         t = threading.Thread(
-                            target=self._speak_from_cursor, daemon=True)
+                            target=self._speak_from_cursor, args=(hwnd,), daemon=True)
                         t.start()
                 elif msg.wParam == _HOTKEY_ESC:
                     log.info("Esc → 読み上げ停止")
@@ -649,11 +681,15 @@ class HotkeyHandler:
         finally:
             self._lock.release()
 
-    def _speak_from_cursor(self) -> None:
+    def _speak_from_cursor(self, hwnd: int = 0) -> None:
         if not self._lock.acquire(blocking=False):
             return
         try:
-            time.sleep(0.3)  # キーを離すのを待つ
+            time.sleep(0.4)  # キーを離すのを待つ
+            # ホットキー発火時のウィンドウに確実にフォーカスを戻す
+            if hwnd:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                time.sleep(0.1)
             text = self._clipboard.get_text_from_cursor()
             if text:
                 log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
