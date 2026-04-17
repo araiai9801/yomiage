@@ -63,25 +63,12 @@ pip install pystray pyperclip pillow edge-tts
 
 tkinter は Python 標準付属なので追加インストール不要です。
 
-### 手順 4. 起動用バッチのパスを自分の環境に合わせる（重要）
-
-`yomiage.bat` をメモ帳で開き、12 行目の 2 つのパスを **自分の環境に合わせて書き換えてください**:
-
-```bat
-start "" "C:\Users\arai\AppData\Local\Programs\Python\Python313\pythonw.exe" "C:\Users\arai\OneDrive\ドキュメント\code\ClaudeCode\yomiage\yomiage.py"
-```
-
-- 1 つ目: `pythonw.exe` のフルパス
-  - 通常は `C:\Users\<あなた>\AppData\Local\Programs\Python\Python3XX\pythonw.exe`
-  - 分からない場合はコマンドプロンプトで `where pythonw` を実行
-- 2 つ目: `yomiage.py` のフルパス（手順 2 で展開した場所）
-
-> PowerShell スクリプト（`register_context_menu.ps1`, `setup_startup.ps1`）の中にも同じパスがあります。使う場合は合わせて書き換えてください。
-
-### 手順 5. 起動する
+### 手順 4. 起動する
 
 `yomiage.bat` をダブルクリック。
 タスクトレイ（画面右下の時計の近く）に **「読」** というアイコンが出れば起動成功です。
+
+> `pythonw.exe` と `yomiage.py` のパスはスクリプトが自動検出します。手動でのパス書き換えは不要です。
 
 ---
 

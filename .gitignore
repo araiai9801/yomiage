@@ -4,4 +4,3 @@ __pycache__/
 *.lnk
 _tts_output.mp3
 create_startup.ps1
-setup_startup.ps1
