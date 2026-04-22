@@ -77,6 +77,7 @@ _WM_USER          = 0x0400
 
 _HOTKEY_READ      = 1
 _HOTKEY_READ_END  = 3   # Ctrl+Alt+E
+_HOTKEY_PAUSE     = 4   # Tab（読み上げ中のみ）
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -141,6 +142,12 @@ class _INPUT(ctypes.Structure):
 
 _VK_MENU    = 0x12   # Alt
 _VK_SHIFT   = 0x10
+_VK_RIGHT   = 0x27   # →（拡張キー）
+_VK_TAB     = 0x09
+_VK_F_KEY   = 0x46   # F
+_VK_A_KEY   = 0x41   # A
+_VK_V_KEY   = 0x56   # V
+_VK_RETURN  = 0x0D
 
 
 def _release_modifiers() -> None:
@@ -202,6 +209,65 @@ def _send_ctrl_shift_end_then_copy() -> None:
     _send_one_key(_VK_C, _KEYEVENTF_KEYUP)
     time.sleep(0.02)
     _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
+
+    # Step3: Right arrow で選択を解除（全反転を解除してカーソルを末尾へ）
+    time.sleep(0.1)
+    _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY)
+    time.sleep(0.05)
+    _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
+
+
+# =====================================================================
+# チャンクスクロール — Ctrl+F でカーソル位置に戻ってハイライト表示
+# =====================================================================
+def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
+    """Ctrl+F で chunk の先頭をブラウザ/テキストエディタで検索しスクロール表示する。
+    見つからない場合は静かに無視する。"""
+    if not hwnd or not chunk_text.strip():
+        return
+    try:
+        # フォーカスを対象ウィンドウに戻す
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+
+        # 検索キーワード: 最初の 20 文字（句読点・空白を除いた先頭部分）
+        keyword = chunk_text.strip()[:20]
+        if not keyword:
+            return
+        pyperclip.copy(keyword)
+        time.sleep(0.05)
+
+        # Ctrl+F — 検索バーを開く
+        _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
+        _send_one_key(_VK_F_KEY, 0);    time.sleep(0.02)
+        _send_one_key(_VK_F_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
+        _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
+        time.sleep(0.35)   # 検索バーが開くのを待つ
+
+        # 検索ボックス内を全選択 (Ctrl+A) → 貼り付け (Ctrl+V)
+        _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
+        _send_one_key(_VK_A_KEY, 0);    time.sleep(0.02)
+        _send_one_key(_VK_A_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
+        _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP); time.sleep(0.05)
+
+        _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
+        _send_one_key(_VK_V_KEY, 0);    time.sleep(0.02)
+        _send_one_key(_VK_V_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
+        _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
+        time.sleep(0.15)
+
+        # Enter — 検索実行（ページがスクロールされ、該当テキストがハイライト）
+        _send_one_key(_VK_RETURN, 0);   time.sleep(0.05)
+        _send_one_key(_VK_RETURN, _KEYEVENTF_KEYUP)
+        time.sleep(0.2)
+
+        # Escape — 検索バーを閉じる（Edge/Chrome はスクロール位置を維持）
+        _send_one_key(_VK_ESCAPE, 0);   time.sleep(0.05)
+        _send_one_key(_VK_ESCAPE, _KEYEVENTF_KEYUP)
+        time.sleep(0.1)
+
+    except Exception as e:
+        log.warning(f"チャンクスクロール失敗: {e}")
 
 
 # =====================================================================
@@ -376,8 +442,11 @@ class TTSEngine:
         self._proc_lock = threading.Lock()
         self._speaking = threading.Event()
         self._stop_flag = threading.Event()
+        self._pause_flag = threading.Event()   # セットされたら一時停止
         self._done = threading.Event()
         self._done.set()
+        self._source_hwnd: int = 0             # Ctrl+Alt+E 発火時のウィンドウ
+        self._current_chunk: str = ""          # 一時停止時の表示用
         self._python_exe: str | None = None
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
@@ -394,7 +463,7 @@ class TTSEngine:
     def is_speaking(self) -> bool:
         return self._speaking.is_set()
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, source_hwnd: int = 0) -> None:
         if not text.strip():
             return
         while not self._queue.empty():
@@ -402,8 +471,28 @@ class TTSEngine:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+        self._source_hwnd = source_hwnd
+        self._pause_flag.clear()
         self._done.clear()
         self._queue.put(text)
+
+    def pause(self) -> None:
+        """Tab キーによる一時停止"""
+        if self._speaking.is_set() and not self._pause_flag.is_set():
+            _mci("pause tts")
+            self._pause_flag.set()
+            if self._overlay is not None:
+                self._overlay.update("⏸ 一時停止中 — Tab で再開", self._current_chunk)
+            log.info("TTS 一時停止")
+
+    def resume(self) -> None:
+        """Tab キーによる再開"""
+        if self._speaking.is_set() and self._pause_flag.is_set():
+            _mci("resume tts")
+            self._pause_flag.clear()
+            if self._overlay is not None:
+                self._overlay.update("▶ 読み上げ再開", self._current_chunk)
+            log.info("TTS 再開")
 
     def wait_done(self, timeout: float | None = None) -> bool:
         return self._done.wait(timeout=timeout)
@@ -415,6 +504,7 @@ class TTSEngine:
             except queue.Empty:
                 break
         self._stop_flag.set()
+        self._pause_flag.clear()   # 一時停止も解除
         # edge-tts 生成中ならプロセスを kill
         with self._proc_lock:
             if self._gen_proc and self._gen_proc.poll() is None:
@@ -482,10 +572,13 @@ class TTSEngine:
             log.error(f"MCI play 失敗 rc={rc}")
             _mci("close tts")
             return
-        # 再生完了をポーリングで待つ
+        # 再生完了をポーリングで待つ（一時停止中はスリープのみ）
         while not self._stop_flag.is_set():
+            if self._pause_flag.is_set():
+                time.sleep(0.05)
+                continue
             status = _mci_status("status tts mode")
-            if status != "playing":
+            if status not in ("playing", "paused"):
                 break
             time.sleep(0.1)
         _mci("stop tts")
@@ -550,7 +643,12 @@ class TTSEngine:
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
+                # Ctrl+Alt+E の場合のみ: 読み上げ位置にスクロール＆ハイライト
+                if self._source_hwnd:
+                    _scroll_to_chunk(chunk, self._source_hwnd)
+
                 # オーバーレイを更新（現在のチャンクを表示）
+                self._current_chunk = chunk
                 if self._overlay is not None:
                     title = f"読み上げ中 {i+1}/{len(chunks)}"
                     if i == 0:
@@ -657,8 +755,10 @@ class ClipboardManager:
 # HotkeyHandler — Ctrl+Alt+R + Esc (読み上げ中のみ動的に登録/解除)
 # =====================================================================
 _HOTKEY_ESC = 2
-_MSG_REGISTER_ESC   = _WM_USER + 1
-_MSG_UNREGISTER_ESC = _WM_USER + 2
+_MSG_REGISTER_ESC    = _WM_USER + 1
+_MSG_UNREGISTER_ESC  = _WM_USER + 2
+_MSG_REGISTER_TAB    = _WM_USER + 3
+_MSG_UNREGISTER_TAB  = _WM_USER + 4
 
 
 class HotkeyHandler:
@@ -668,22 +768,33 @@ class HotkeyHandler:
         self._lock = threading.Lock()
         self._thread_id: int | None = None
         self._esc_registered = False
+        self._tab_registered = False
 
     def register(self) -> None:
         t = threading.Thread(target=self._hotkey_loop, daemon=True)
         t.start()
 
     def _register_esc(self) -> None:
-        """ホットキースレッドに Esc 登録を依頼"""
         if self._thread_id:
             ctypes.windll.user32.PostThreadMessageW(
                 self._thread_id, _MSG_REGISTER_ESC, 0, 0)
 
     def _unregister_esc(self) -> None:
-        """ホットキースレッドに Esc 解除を依頼"""
         if self._thread_id:
             ctypes.windll.user32.PostThreadMessageW(
                 self._thread_id, _MSG_UNREGISTER_ESC, 0, 0)
+
+    def _register_tab(self) -> None:
+        """ホットキースレッドに Tab 登録を依頼"""
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, _MSG_REGISTER_TAB, 0, 0)
+
+    def _unregister_tab(self) -> None:
+        """ホットキースレッドに Tab 解除を依頼"""
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, _MSG_UNREGISTER_TAB, 0, 0)
 
     def _hotkey_loop(self) -> None:
         user32 = ctypes.windll.user32
@@ -729,16 +840,30 @@ class HotkeyHandler:
                     log.info("Esc → 読み上げ停止")
                     self._tts.stop_current()
                     self._do_unregister_esc(user32)
+                    self._do_unregister_tab(user32)
+                elif msg.wParam == _HOTKEY_PAUSE:
+                    if self._tts._pause_flag.is_set():
+                        log.info("Tab → 再開")
+                        self._tts.resume()
+                    else:
+                        log.info("Tab → 一時停止")
+                        self._tts.pause()
 
             elif msg.message == _MSG_REGISTER_ESC:
                 self._do_register_esc(user32)
             elif msg.message == _MSG_UNREGISTER_ESC:
                 self._do_unregister_esc(user32)
+            elif msg.message == _MSG_REGISTER_TAB:
+                self._do_register_tab(user32)
+            elif msg.message == _MSG_UNREGISTER_TAB:
+                self._do_unregister_tab(user32)
 
         user32.UnregisterHotKey(None, _HOTKEY_READ)
         user32.UnregisterHotKey(None, _HOTKEY_READ_END)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
+        if self._tab_registered:
+            user32.UnregisterHotKey(None, _HOTKEY_PAUSE)
 
     def _do_register_esc(self, user32) -> None:
         if not self._esc_registered:
@@ -754,6 +879,20 @@ class HotkeyHandler:
             self._esc_registered = False
             log.info("Esc ホットキー解除")
 
+    def _do_register_tab(self, user32) -> None:
+        if not self._tab_registered:
+            if user32.RegisterHotKey(None, _HOTKEY_PAUSE, 0, _VK_TAB):
+                self._tab_registered = True
+                log.info("Tab ホットキー登録（一時停止/再開）")
+            else:
+                log.warning("Tab ホットキー登録失敗（他アプリが使用中の可能性）")
+
+    def _do_unregister_tab(self, user32) -> None:
+        if self._tab_registered:
+            user32.UnregisterHotKey(None, _HOTKEY_PAUSE)
+            self._tab_registered = False
+            log.info("Tab ホットキー解除")
+
     def _speak_selected_text(self) -> None:
         if not self._lock.acquire(blocking=False):
             return
@@ -763,9 +902,11 @@ class HotkeyHandler:
             if text:
                 log.info(f"読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
+                self._register_tab()
                 self._tts.speak(text)
                 self._tts.wait_done()
                 self._unregister_esc()
+                self._unregister_tab()
             else:
                 log.info("テキストが取得できませんでした")
         finally:
@@ -784,9 +925,11 @@ class HotkeyHandler:
             if text:
                 log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
-                self._tts.speak(text)
+                self._register_tab()
+                self._tts.speak(text, source_hwnd=hwnd)   # hwnd を渡してスクロール有効化
                 self._tts.wait_done()
                 self._unregister_esc()
+                self._unregister_tab()
             else:
                 log.info("カーソル位置からテキストが取得できませんでした")
         finally:
@@ -807,7 +950,7 @@ class TrayApp:
         )
         self._icon = pystray.Icon(
             "yomiage", img,
-            "読み上げ  Ctrl+Alt+R(選択) / Ctrl+Alt+E(末尾まで) / Esc で停止",
+            "読み上げ  Ctrl+Alt+R(選択) / Ctrl+Alt+E(末尾まで) / Tab(一時停止) / Esc(停止)",
             menu,
         )
 
