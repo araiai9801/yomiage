@@ -223,12 +223,11 @@ def _is_chromium_browser(hwnd: int) -> bool:
 
 
 def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
-    """Chromium 系ブラウザ限定: Ctrl+F でチャンク先頭へスクロール。
-    ブラウザ以外（Word・メモ帳等）はスキップして何もしない。"""
+    """Ctrl+F でチャンク先頭へスクロール（Edge/Chrome/Word/メモ帳 共通）。
+    Ctrl+A は使わない（Word で文書全体選択になる恐れがあるため）。
+    Ctrl+F を開くと検索ボックスがフォーカスされ前回語が選択状態になるので
+    Ctrl+V で上書き貼り付けするだけで安全に動作する。"""
     if not hwnd or not chunk_text.strip():
-        return
-    if not _is_chromium_browser(hwnd):
-        log.debug("ブラウザ以外のためスクロールスキップ")
         return
     try:
         # フォーカスを対象ウィンドウに戻す
@@ -242,27 +241,26 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
         pyperclip.copy(keyword)
         time.sleep(0.05)
 
-        # Ctrl+F — 検索バーを開く
-        # Chrome/Edge は開くと前回の検索語が選択状態になるので Ctrl+V で上書きできる
+        # Ctrl+F — 検索バー/ダイアログを開く
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_F_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_F_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
-        time.sleep(0.35)   # 検索バーが開くのを待つ
+        time.sleep(0.5)    # 検索バーが開いてフォーカスが移るのを待つ
 
-        # Ctrl+V — 貼り付け（前回語は自動選択されているので上書きされる）
+        # Ctrl+V — 貼り付け（検索ボックスに前回語が選択されていれば上書き）
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_V_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_V_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
         time.sleep(0.15)
 
-        # Enter — 検索実行（ページがスクロール）
+        # Enter — 検索実行（ページ/文書がスクロール）
         _send_one_key(_VK_RETURN, 0);   time.sleep(0.05)
         _send_one_key(_VK_RETURN, _KEYEVENTF_KEYUP)
-        time.sleep(0.2)
+        time.sleep(0.25)
 
-        # Escape — 検索バーを閉じる（スクロール位置は維持される）
+        # Escape — 検索バー/ダイアログを閉じる（スクロール位置は維持）
         _send_one_key(_VK_ESCAPE, 0);   time.sleep(0.05)
         _send_one_key(_VK_ESCAPE, _KEYEVENTF_KEYUP)
         time.sleep(0.1)
