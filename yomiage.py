@@ -222,48 +222,53 @@ def _is_chromium_browser(hwnd: int) -> bool:
     return "Chrome_WidgetWin" in buf.value
 
 
+def _is_chromium_browser(hwnd: int) -> bool:
+    """Edge / Chrome など Chromium 系ブラウザのウィンドウかどうかを判定"""
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+    return "Chrome_WidgetWin" in buf.value
+
+
 def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
-    """Ctrl+F でチャンク先頭へスクロール（Edge/Chrome/Word/メモ帳 共通）。
-    Ctrl+A は使わない（Word で文書全体選択になる恐れがあるため）。
-    Ctrl+F を開くと検索ボックスがフォーカスされ前回語が選択状態になるので
-    Ctrl+V で上書き貼り付けするだけで安全に動作する。"""
+    """Chromium 系ブラウザ限定: Ctrl+F でチャンク先頭へスクロール。
+    【重要】Escape を送信しない — SendInput の Escape が RegisterHotKey の
+    「Esc=停止」を誤発動させるため。Find バーは開いたままにする。
+    Word・メモ帳等ではスキップ（Ctrl+F の挙動が異なり干渉するため）。"""
     if not hwnd or not chunk_text.strip():
         return
+    if not _is_chromium_browser(hwnd):
+        return   # ブラウザ以外はスキップ
     try:
-        # フォーカスを対象ウィンドウに戻す
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.15)
 
-        # 検索キーワード: 最初の 20 文字
         keyword = chunk_text.strip()[:20]
         if not keyword:
             return
         pyperclip.copy(keyword)
         time.sleep(0.05)
 
-        # Ctrl+F — 検索バー/ダイアログを開く
+        # Ctrl+F — 検索バーを開く（既に開いていれば前回語が選択状態）
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_F_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_F_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
-        time.sleep(0.5)    # 検索バーが開いてフォーカスが移るのを待つ
+        time.sleep(0.4)
 
-        # Ctrl+V — 貼り付け（検索ボックスに前回語が選択されていれば上書き）
+        # Ctrl+V — 貼り付け（前回語を上書き）
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_V_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_V_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
         time.sleep(0.15)
 
-        # Enter — 検索実行（ページ/文書がスクロール）
+        # Enter — 検索実行・スクロール
         _send_one_key(_VK_RETURN, 0);   time.sleep(0.05)
         _send_one_key(_VK_RETURN, _KEYEVENTF_KEYUP)
-        time.sleep(0.25)
-
-        # Escape — 検索バー/ダイアログを閉じる（スクロール位置は維持）
-        _send_one_key(_VK_ESCAPE, 0);   time.sleep(0.05)
-        _send_one_key(_VK_ESCAPE, _KEYEVENTF_KEYUP)
-        time.sleep(0.1)
+        time.sleep(0.2)
+        # ※ Escape は送信しない（Esc ホットキーを誤発動させるため）
+        # Find バーは読み上げ終了後にユーザーが手動で閉じるか、
+        # 読み上げ停止（Esc）時に自動で閉じる
 
     except Exception as e:
         log.warning(f"チャンクスクロール失敗: {e}")
@@ -642,7 +647,7 @@ class TTSEngine:
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
-                # Ctrl+Alt+E の場合のみ: 読み上げ位置にスクロール＆ハイライト
+                # Ctrl+Alt+E の場合のみ: 読み上げ位置にスクロール
                 if self._source_hwnd:
                     _scroll_to_chunk(chunk, self._source_hwnd)
 
@@ -922,12 +927,12 @@ class HotkeyHandler:
                 time.sleep(0.1)
             text = self._clipboard.get_text_from_cursor()
             if text:
-                # クリップボード取得完了後に選択を解除（全反転を消す）
+                # クリップボード取得完了後、Left arrow で選択を解除しカーソルを先頭（元の位置）に戻す
                 _release_modifiers()
                 time.sleep(0.05)
-                _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY)
+                _send_one_key(0x25, _KEYEVENTF_EXTENDEDKEY)           # VK_LEFT（拡張キー）
                 time.sleep(0.05)
-                _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
+                _send_one_key(0x25, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
                 time.sleep(0.05)
                 log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
