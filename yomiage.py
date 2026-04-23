@@ -255,20 +255,15 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
         time.sleep(0.4)
 
-        # Ctrl+V — 貼り付け（前回語を上書き）
+        # Ctrl+V — 貼り付け
+        # Chrome/Edge はテキストを貼り付けた時点でライブ検索・ページスクロールする。
+        # Enter を押すと「次のマッチへ移動」になりズレるため送信しない。
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_V_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_V_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
-        time.sleep(0.15)
-
-        # Enter — 検索実行・スクロール
-        _send_one_key(_VK_RETURN, 0);   time.sleep(0.05)
-        _send_one_key(_VK_RETURN, _KEYEVENTF_KEYUP)
-        time.sleep(0.2)
-        # ※ Escape は送信しない（Esc ホットキーを誤発動させるため）
-        # Find バーは読み上げ終了後にユーザーが手動で閉じるか、
-        # 読み上げ停止（Esc）時に自動で閉じる
+        time.sleep(0.25)   # スクロールアニメーション完了を待つ
+        # ※ Enter・Escape は送信しない
 
     except Exception as e:
         log.warning(f"チャンクスクロール失敗: {e}")
