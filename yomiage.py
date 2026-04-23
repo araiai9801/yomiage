@@ -210,27 +210,32 @@ def _send_ctrl_shift_end_then_copy() -> None:
     time.sleep(0.02)
     _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
 
-    # Step3: Right arrow で選択を解除（全反転を解除してカーソルを末尾へ）
-    time.sleep(0.1)
-    _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY)
-    time.sleep(0.05)
-    _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
 
 
 # =====================================================================
-# チャンクスクロール — Ctrl+F でカーソル位置に戻ってハイライト表示
+# チャンクスクロール — ブラウザ限定で Ctrl+F によるスクロール表示
 # =====================================================================
+def _is_chromium_browser(hwnd: int) -> bool:
+    """Edge / Chrome など Chromium 系ブラウザのウィンドウかどうかを判定"""
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+    return "Chrome_WidgetWin" in buf.value
+
+
 def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
-    """Ctrl+F で chunk の先頭をブラウザ/テキストエディタで検索しスクロール表示する。
-    見つからない場合は静かに無視する。"""
+    """Chromium 系ブラウザ限定: Ctrl+F でチャンク先頭へスクロール。
+    ブラウザ以外（Word・メモ帳等）はスキップして何もしない。"""
     if not hwnd or not chunk_text.strip():
+        return
+    if not _is_chromium_browser(hwnd):
+        log.debug("ブラウザ以外のためスクロールスキップ")
         return
     try:
         # フォーカスを対象ウィンドウに戻す
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.15)
 
-        # 検索キーワード: 最初の 20 文字（句読点・空白を除いた先頭部分）
+        # 検索キーワード: 最初の 20 文字
         keyword = chunk_text.strip()[:20]
         if not keyword:
             return
@@ -238,30 +243,26 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
         time.sleep(0.05)
 
         # Ctrl+F — 検索バーを開く
+        # Chrome/Edge は開くと前回の検索語が選択状態になるので Ctrl+V で上書きできる
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_F_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_F_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
         time.sleep(0.35)   # 検索バーが開くのを待つ
 
-        # 検索ボックス内を全選択 (Ctrl+A) → 貼り付け (Ctrl+V)
-        _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
-        _send_one_key(_VK_A_KEY, 0);    time.sleep(0.02)
-        _send_one_key(_VK_A_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
-        _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP); time.sleep(0.05)
-
+        # Ctrl+V — 貼り付け（前回語は自動選択されているので上書きされる）
         _send_one_key(_VK_CONTROL, 0);  time.sleep(0.02)
         _send_one_key(_VK_V_KEY, 0);    time.sleep(0.02)
         _send_one_key(_VK_V_KEY, _KEYEVENTF_KEYUP); time.sleep(0.02)
         _send_one_key(_VK_CONTROL, _KEYEVENTF_KEYUP)
         time.sleep(0.15)
 
-        # Enter — 検索実行（ページがスクロールされ、該当テキストがハイライト）
+        # Enter — 検索実行（ページがスクロール）
         _send_one_key(_VK_RETURN, 0);   time.sleep(0.05)
         _send_one_key(_VK_RETURN, _KEYEVENTF_KEYUP)
         time.sleep(0.2)
 
-        # Escape — 検索バーを閉じる（Edge/Chrome はスクロール位置を維持）
+        # Escape — 検索バーを閉じる（スクロール位置は維持される）
         _send_one_key(_VK_ESCAPE, 0);   time.sleep(0.05)
         _send_one_key(_VK_ESCAPE, _KEYEVENTF_KEYUP)
         time.sleep(0.1)
@@ -923,6 +924,13 @@ class HotkeyHandler:
                 time.sleep(0.1)
             text = self._clipboard.get_text_from_cursor()
             if text:
+                # クリップボード取得完了後に選択を解除（全反転を消す）
+                _release_modifiers()
+                time.sleep(0.05)
+                _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY)
+                time.sleep(0.05)
+                _send_one_key(_VK_RIGHT, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
+                time.sleep(0.05)
                 log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
                 self._register_tab()
