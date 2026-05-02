@@ -388,7 +388,7 @@ import re as _re
 _SENTENCE_SPLIT = _re.compile(r'(?<=[。！？!?\n])\s*')
 
 # 1チャンクの最大文字数（これ以上は強制分割）
-_CHUNK_MAX_CHARS = 120
+_CHUNK_MAX_CHARS = 50
 
 
 def _split_into_chunks(text: str) -> list[str]:
@@ -441,12 +441,16 @@ class TTSEngine:
         self._proc_lock = threading.Lock()
         self._speaking = threading.Event()
         self._stop_flag = threading.Event()
-        self._pause_flag = threading.Event()   # セットされたら一時停止
         self._done = threading.Event()
         self._done.set()
         self._source_hwnd: int = 0             # Ctrl+Alt+E 発火時のウィンドウ
         self._current_chunk: str = ""          # 一時停止時の表示用
         self._python_exe: str | None = None
+        # ---- Tab チャンク境界一時停止 ----
+        self._tab_lock = threading.Lock()
+        self._tab_pause_requested: bool = False  # Tab押下→次境界で停止
+        self._tab_paused: bool = False           # 現在チャンク境界で停止中
+        self._tab_resume_event = threading.Event()
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
@@ -471,27 +475,29 @@ class TTSEngine:
             except queue.Empty:
                 break
         self._source_hwnd = source_hwnd
-        self._pause_flag.clear()
         self._done.clear()
         self._queue.put(text)
 
-    def pause(self) -> None:
-        """Tab キーによる一時停止"""
-        if self._speaking.is_set() and not self._pause_flag.is_set():
-            _mci("pause tts")
-            self._pause_flag.set()
-            if self._overlay is not None:
-                self._overlay.update("⏸ 一時停止中 — Tab で再開", self._current_chunk)
-            log.info("TTS 一時停止")
-
-    def resume(self) -> None:
-        """Tab キーによる再開"""
-        if self._speaking.is_set() and self._pause_flag.is_set():
-            _mci("resume tts")
-            self._pause_flag.clear()
-            if self._overlay is not None:
-                self._overlay.update("▶ 読み上げ再開", self._current_chunk)
-            log.info("TTS 再開")
+    def toggle_tab_pause(self) -> None:
+        """Tab キー: チャンク境界での一時停止 / 再開トグル"""
+        if not self._speaking.is_set():
+            return
+        with self._tab_lock:
+            if self._tab_paused:
+                # 現在停止中 → 再開
+                self._tab_paused = False
+                self._tab_resume_event.set()
+                log.info("Tab: 再開")
+                if self._overlay is not None:
+                    self._overlay.update("▶ 読み上げ再開", self._current_chunk)
+            elif self._tab_pause_requested:
+                # 停止予約中 → キャンセル
+                self._tab_pause_requested = False
+                log.info("Tab: 一時停止キャンセル")
+            else:
+                # 再生中 → 次のチャンク境界で停止予約
+                self._tab_pause_requested = True
+                log.info("Tab: 次チャンク境界で一時停止予定")
 
     def wait_done(self, timeout: float | None = None) -> bool:
         return self._done.wait(timeout=timeout)
@@ -503,7 +509,11 @@ class TTSEngine:
             except queue.Empty:
                 break
         self._stop_flag.set()
-        self._pause_flag.clear()   # 一時停止も解除
+        # チャンク境界一時停止中なら解除してループを抜けさせる
+        with self._tab_lock:
+            self._tab_pause_requested = False
+            self._tab_paused = False
+            self._tab_resume_event.set()
         # edge-tts 生成中ならプロセスを kill
         with self._proc_lock:
             if self._gen_proc and self._gen_proc.poll() is None:
@@ -571,15 +581,12 @@ class TTSEngine:
             log.error(f"MCI play 失敗 rc={rc}")
             _mci("close tts")
             return
-        # 再生完了をポーリングで待つ（一時停止中はスリープのみ）
+        # 再生完了をポーリングで待つ
         while not self._stop_flag.is_set():
-            if self._pause_flag.is_set():
-                time.sleep(0.05)
-                continue
             status = _mci_status("status tts mode")
-            if status not in ("playing", "paused"):
+            if status != "playing":
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
         _mci("stop tts")
         _mci("close tts")
 
@@ -589,8 +596,18 @@ class TTSEngine:
         self._speaking.set()
         self._stop_flag.clear()
 
+        # Tab 一時停止状態をリセット
+        with self._tab_lock:
+            self._tab_pause_requested = False
+            self._tab_paused = False
+            self._tab_resume_event.clear()
+
         tmp_dir = Path(__file__).parent
         generated_files: list[Path] = []
+
+        # 先読みスレッドをループをまたいで持ち越す
+        prefetch_thread: threading.Thread | None = None
+        prefetch_ok: list[bool] = [False]
 
         try:
             for i, chunk in enumerate(chunks):
@@ -599,23 +616,17 @@ class TTSEngine:
                     break
 
                 mp3_file = tmp_dir / f"_tts_chunk_{i}.mp3"
-                generated_files.append(mp3_file)
+                if mp3_file not in generated_files:
+                    generated_files.append(mp3_file)
 
-                # ---- 先読み生成スレッド（次のチャンクを並行生成） ----
-                next_mp3: Path | None = None
-                prefetch_thread: threading.Thread | None = None
-                prefetch_ok: list[bool] = [False]
-
-                if i + 1 < len(chunks):
-                    next_mp3 = tmp_dir / f"_tts_chunk_{i + 1}.mp3"
-                    generated_files.append(next_mp3)
-
-                    def _prefetch(txt=chunks[i + 1], path=next_mp3):
-                        prefetch_ok[0] = self._generate_mp3(txt, path)
-
-                # ---- 現在のチャンクを生成 ----
-                if i == 0:
-                    # 最初のチャンクだけビープ音付き
+                # ---- MP3 取得: 先読み済みなら待つだけ、なければ生成 ----
+                if prefetch_thread is not None:
+                    # 前チャンク再生中に並行生成済み → 完了待ちのみ
+                    prefetch_thread.join(timeout=60)
+                    ok = prefetch_ok[0]
+                    prefetch_thread = None
+                else:
+                    # 最初のチャンク: ビープ音付き生成
                     beep_stop = threading.Event()
 
                     def _beep_loop():
@@ -634,8 +645,6 @@ class TTSEngine:
                     ok = self._generate_mp3(chunk, mp3_file)
                     beep_stop.set()
                     beep_thread.join(timeout=1)
-                else:
-                    ok = self._generate_mp3(chunk, mp3_file)
 
                 if not ok or self._stop_flag.is_set():
                     break
@@ -655,26 +664,59 @@ class TTSEngine:
                     else:
                         self._overlay.update(title, chunk)
 
-                # 再生開始と同時に次のチャンクを先読み生成
-                if next_mp3 is not None:
+                # ---- 現チャンク再生と並行して次チャンクを先読み生成 ----
+                prefetch_ok = [False]
+                prefetch_thread = None
+                if i + 1 < len(chunks):
+                    next_mp3 = tmp_dir / f"_tts_chunk_{i + 1}.mp3"
+                    generated_files.append(next_mp3)
+
+                    def _prefetch(txt=chunks[i + 1], path=next_mp3, ok_ref=prefetch_ok):
+                        ok_ref[0] = self._generate_mp3(txt, path)
+
                     prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
                     prefetch_thread.start()
 
                 self._play_mp3(mp3_file)
 
-                # 先読み完了を待つ
-                if prefetch_thread is not None:
-                    prefetch_thread.join(timeout=60)
-
                 if self._stop_flag.is_set():
                     log.info("TTS 中断（Esc/停止）")
                     break
+
+                # ---- Tab によるチャンク境界一時停止 ----
+                with self._tab_lock:
+                    should_pause = self._tab_pause_requested
+                    if should_pause:
+                        self._tab_pause_requested = False
+                        self._tab_paused = True
+
+                if should_pause:
+                    self._tab_resume_event.clear()
+                    if self._overlay is not None:
+                        self._overlay.update("⏸ 一時停止中 — Tab で再開", self._current_chunk)
+                    log.info("Tab 一時停止（チャンク境界）")
+                    # Tab で再開 または Esc で stop_current() が set() するまで待機
+                    self._tab_resume_event.wait()
+                    with self._tab_lock:
+                        self._tab_paused = False
+                    if self._stop_flag.is_set():
+                        log.info("TTS 中断（一時停止中に Esc）")
+                        break
+                    log.info("Tab 再開")
             else:
                 log.info("TTS 完了")
 
         except Exception as e:
             log.error(f"TTS エラー: {e}")
         finally:
+            # 先読みスレッドのクリーンアップ
+            if prefetch_thread is not None:
+                prefetch_thread.join(timeout=5)
+            # Tab 停止状態を解除
+            with self._tab_lock:
+                self._tab_pause_requested = False
+                self._tab_paused = False
+                self._tab_resume_event.set()
             with self._proc_lock:
                 self._gen_proc = None
             self._speaking.clear()
@@ -841,12 +883,8 @@ class HotkeyHandler:
                     self._do_unregister_esc(user32)
                     self._do_unregister_tab(user32)
                 elif msg.wParam == _HOTKEY_PAUSE:
-                    if self._tts._pause_flag.is_set():
-                        log.info("Tab → 再開")
-                        self._tts.resume()
-                    else:
-                        log.info("Tab → 一時停止")
-                        self._tts.pause()
+                    log.info("Tab → チャンク境界一時停止/再開")
+                    self._tts.toggle_tab_pause()
 
             elif msg.message == _MSG_REGISTER_ESC:
                 self._do_register_esc(user32)
