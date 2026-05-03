@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WordもEdgeも要らない──どんなアプリのテキストも一瞬で音声化するホットキーツールを自作した</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f7f2;
+      --text: #202124;
+      --muted: #5f6368;
+      --border: #d8d6cc;
+      --accent: #00796b;
+      --accent-bg: #e6f4f1;
+      --code-bg: #eeeeea;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111312;
+        --text: #eeeeea;
+        --muted: #b9bab5;
+        --border: #343734;
+        --accent: #4db6ac;
+        --accent-bg: #173330;
+        --code-bg: #222522;
+      }
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.9;
+    }
+
+    main {
+      box-sizing: border-box;
+      width: min(880px, 100%);
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }
+
+    h1 {
+      margin: 0 0 32px;
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      line-height: 1.28;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 48px 0 16px;
+      padding-left: 14px;
+      border-left: 5px solid var(--accent);
+      font-size: clamp(1.35rem, 3vw, 1.8rem);
+      line-height: 1.45;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0 0 1.25em;
+      font-size: 1.05rem;
+    }
+
+    ol {
+      margin: 0 0 1.4em;
+      padding-left: 1.6em;
+    }
+
+    li {
+      margin: 0.35em 0;
+      font-size: 1.05rem;
+    }
+
+    strong {
+      background: var(--accent-bg);
+      padding: 0.05em 0.25em;
+      font-weight: 700;
+    }
+
+    code {
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--code-bg);
+      padding: 0.1em 0.35em;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 0.95em;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration-thickness: 0.08em;
+      text-underline-offset: 0.2em;
+    }
+
+    .lead {
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    @media (max-width: 640px) {
+      main {
+        padding: 32px 18px 56px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>WordもEdgeも要らない──どんなアプリのテキストも一瞬で音声化するホットキーツールを自作した</h1>
+
+    <h2>なぜ作ったのか</h2>
+
+    <p>緑内障を患っており、両目とも視力が相当悪い。近眼とは違い、眼鏡をかけても視力はほとんど変わらない。背景黒画面に白文字は比較的読めるが、白画面に黒文字はとても読みづらい。200％拡大画面スクロールしながら追う日常が続いている。</p>
+
+    <p>Word や Edge には優秀な読み上げ機能がある。とても助かっている。しかし世の中のソフトすべてがそうではない。メモ帳、PDF ビューア、SNS、社内ツール——読み上げに対応していないアプリはまだ多く、そのたびにコピペしてWordに貼り付けて読み上げさせるか、拡大しながら目を酷使するしかなかった。「どんなアプリでも、選択してキーを押すだけで読んでくれるものがあれば」。それが出発点だった。</p>
+
+    <h2>完成まで数週間かかった理由</h2>
+
+    <p>Claude Code に最初の指示を出したのは4月の中頃。ClaudeCodeのバイブコーディングくぉ試そうと思い手始めに自分の困りごとからスタートした。「Windows で選択テキストをホットキーで読み上げるアプリを作ってほしい」。Claude はすぐに動いた。Microsoft の edge-tts（Nanami Neural という高品質な日本語音声）を使い、グローバルホットキーで動く Python アプリをあっという間に生成した。</p>
+
+    <p>ところがそこからが長かった。</p>
+
+    <p>最初の難関は「一時停止」の仕様だ。当初は Esc キーで即停止するだけだったが、使っているうちに「長い文章の途中で止めたい」という欲求が出てきた。Tab キーで一時停止・再開できないか、と仕様を追加した。Claude はすぐ実装してくれたが、試してみると <strong>Tab を押しても止まらない</strong>。</p>
+
+    <p>何度修正を依頼しても変わらない。「チャンクが短くなっていない」「キーが効かない」と操作の感想を伝え続けること数十回。こりゃダメだ、こんなものかとあきらめかけていた。</p>
+
+    <p>ある日、「もしかして、Claude が編集しているファイルと、私が起動しているファイルは同じですか？」と聞いてみた。</p>
+
+    <p>Claude がレジストリを調べると——<strong>別ファイルだった</strong>。</p>
+
+    <p>私はデスクトップの右クリックメニューから <code>yomiage\yomiage.py</code> を起動していた。一方、Claude が修正し続けていたのは別の <code>screen_reader.py</code> というファイル。何セッションもかけて積み上げた修正が、まるごと無関係なファイルへの変更だったのだ。気づいたのは Claude で、私ではない。ただ「違うかもしれない」と疑問を口にしただけだ。直したはずのファイルが直っていないのは、実は別ファイルだったというのはよくある話だ。これがWordやExcelならすぐに気が付いたはずだ。プログラムコードの場合は何かバグなのか？と疑ってしまい、修正箇所の間違いに気付かないことがある。ましてバイブコーディングなので、コードを見るわわけでもないのでなおさらだ。これは落とし穴ですね。ともあれ、違うファイルだとわかったときは、アホさ加減に笑うしかなかった。当然違うファイルを見ているなどと思うはずもない。思い込みは間違いの元。Claudeは私が操作してるアプリを知らず私はClaudeがいじっているCodeを見ていない。バイブコーディングのあるあるなのかも。まあこういうことは徐々に慣れていくしかない。</p>
+
+    <h2>仕様の変遷と技術的な躓き</h2>
+
+    <p>正しいファイルを修正対象に定めてからも、試行錯誤は続いた。</p>
+
+    <p><strong>チャンク分割の調整</strong>。長文を文節ごとに区切って順に読み上げる仕組みなのだが、1チャンクが長すぎて Tab を押しても「最後まで読んでから止まる」まで体感的に長く感じる。チャンクの最大文字数を 120 → 50 に縮めると、今度はチャンクとチャンクの間に無音の「間」が生じて不自然な読み上げになった。</p>
+
+    <p>Claude がコードを調べると、プリフェッチ（次のチャンクを再生中に並行生成する仕組み）が実は機能していなかった。先読みして生成したはずの MP3 ファイルを、次のイテレーションでまた一から生成し直すバグがあり、プリフェッチが丸ごと無駄になっていた。修正後、チャンク間のギャップはほぼ消えた。私がしたのは「チャンクの間が空きすぎる」と伝えただけだ。</p>
+
+    <p><strong>Tab キーの動作仕様も変わった</strong>。最初は音声を途中でブツッと止める実装だったが、実際に聴いてみると不自然だった。「今の文節が終わってから止まってほしい」と伝えると、Claude が方式を切り替えた。私はコードを見ていない。聴いた感想を言っただけだ。</p>
+
+    <p><strong>KEYEVENTF_EXTENDEDKEY の罠</strong>。「カーソル位置から文末まで読む」機能が動かない時期も長かった。私には何が起きているか分からない。「動かない」と伝え続けた。Claude がログを追い、Windows の SendInput API における拡張キーフラグの欠落を突き止め、修正した。私の役割はひたすら「これは違う」と言い続けることだった。</p>
+
+    <h2>使ってみて</h2>
+
+    <p>完成したアプリは、メモ帳でも PDF でも Line でも、テキストを選んで Ctrl+Alt+R を押すだけで読み上げが始まる。Tab で文節の区切りに一時停止/再開、Esc で即停止。画面下部には今読んでいる文節がオーバーレイ拡大表示される。目が弱い自分には、これが特にありがたい。</p>
+
+    <h2>今後の改良点</h2>
+
+    <p>長い文の場合、何度も選択・読み上げを繰り返すのは面倒なのだが、Ctrl+Alt+E でカーソル位置から最後の行まで読み上げてくれる。これは結構愛用している。但し、この機能はすべてのアプリが対応しているわけではない点が残念だが、、、もう一つ改良したいのは、PowerPointの場合、文字列がTextboX内にあるため、その中でしか選択できない点である。最近のAI生成でのパワポ資料は、テキストを1行単位で細切れにtextbox化するので、選択ー読み上げを何度も繰り返さなければならない。まとめて選択する方法があればよいのだが。</p>
+
+    <h2>次期バージョン安比計画</h2>
+
+    <ol>
+      <li>ＯＣＲ読み上：前述のパワポの読み上げに利用できそう</li>
+      <li>要約読み上げ：長文の読み上げは、」個人利用の場合はそれほど問題にならないが、セミナー等でのプレゼン時には時間がかかりすぎるので何とかしたい。これはすぐに実装できそうな気がするので早めに試してみたい。</li>
+    </ol>
+
+    <h2>github公開中</h2>
+
+    <p>数週間かけて完成したこのツール、コードは GitHub で無料公開中だ。Windows ユーザーの方はぜひ。高齢者の方、視力の弱い方、視力の良いかたでも目が疲れないので便利ですよ ^^) _旦~~</p>
+
+    <p>🔗 <a href="https://github.com/araiai9801/yomiage">https://github.com/araiai9801/yomiage</a></p>
+  </main>
+</body>
+</html>
