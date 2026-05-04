@@ -371,7 +371,7 @@ def _mci(cmd: str) -> int:
     """MCI コマンドを送信して戻り値を返す"""
     ret = _mciSendStringW(cmd, None, 0, None)
     if ret != 0:
-        log.debug(f"MCI '{cmd}' → rc={ret}")
+        log.warning(f"MCI '{cmd}' → rc={ret}")  # DEBUG→WARNING: ログに常時出力
     return ret
 
 
@@ -754,13 +754,14 @@ class TTSEngine:
 
                 # フェーズ2: "playing" が終わるのを待つ
                 # MCI は play 直後に "playing" → 瞬時に "stopped" へ遷移する場合がある。
-                # そのまま "not playing" と判断すると 1ms で終了してしまう。
-                # そのため「not playing かつ再生開始から 0.3 秒以上経過」を終了条件とする。
+                # 文字数から音声時間を推定し（日本語 TTS ≈ 80ms/文字）、
+                # その 90% を経過するまでは "not playing" でも終了しない。
+                _estimated_s = max(len(chunk) * 0.08, 1.0)
                 _phase2_start = time.monotonic()
                 while not self._stop_flag.is_set():
                     mode = _mci_status(f"status {cur_alias} mode")
                     elapsed = time.monotonic() - _phase2_start
-                    if mode != "playing" and elapsed >= 0.3:
+                    if mode != "playing" and elapsed >= _estimated_s * 0.9:
                         break
                     time.sleep(0.05)
 
@@ -817,22 +818,30 @@ class TTSEngine:
 
                     if prep_open_ok[0]:
                         # next_alias は既に open 済み → 即座に play（ギャップほぼゼロ）
-                        _mci(f"play {next_alias}")
+                        rc_play = _mci(f"play {next_alias}")
                         _mci(f"stop {cur_alias}")
                         _mci(f"close {cur_alias}")
                         cur_alias, next_alias = next_alias, cur_alias
-                        already_playing = True
-                        log.info(f"ダブルバッファ切り替え チャンク {i+2}/{len(chunks)}")
+                        if rc_play == 0:
+                            already_playing = True
+                            log.info(f"ダブルバッファ切り替え チャンク {i+2}/{len(chunks)}")
+                        else:
+                            already_playing = False
+                            log.warning(f"ダブルバッファ play 失敗 rc={rc_play} → 次ループで再生成")
                     elif prep_mp3_ok[0]:
                         # MP3 は生成済みだが MCI open が未完 → 今 open して play
                         _mci(f"stop {cur_alias}")
                         _mci(f"close {cur_alias}")
                         rc = _mci(f'open "{next_mp3_path}" type mpegvideo alias {next_alias}')
                         if rc == 0:
-                            _mci(f"play {next_alias}")
-                            cur_alias, next_alias = next_alias, cur_alias
-                            already_playing = True
-                            log.info(f"遅延 open で切り替え チャンク {i+2}/{len(chunks)}")
+                            rc_play = _mci(f"play {next_alias}")
+                            if rc_play == 0:
+                                cur_alias, next_alias = next_alias, cur_alias
+                                already_playing = True
+                                log.info(f"遅延 open で切り替え チャンク {i+2}/{len(chunks)}")
+                            else:
+                                already_playing = False
+                                log.warning(f"遅延 play 失敗 rc={rc_play}")
                         else:
                             already_playing = False
                     else:
