@@ -543,7 +543,10 @@ class TTSEngine:
                     log.info("edge-tts 生成プロセスを終了しました")
                 except Exception:
                     pass
-        # MCI 再生中なら即停止（ダブルバッファ両エイリアス）
+        # MCI 再生中なら即停止
+        _mci("stop tts")
+        _mci("close tts")
+        # 古いダブルバッファエイリアスも念のため閉じる（過去バージョン互換）
         for _a in ("tts_0", "tts_1"):
             _mci(f"stop {_a}")
             _mci(f"close {_a}")
@@ -632,38 +635,55 @@ class TTSEngine:
             self._tab_paused = False
             self._tab_resume_event.clear()
 
-        # OneDrive 同期フォルダだとファイルロックで edge-tts が書き込み失敗するため、
-        # 必ず OneDrive 外（%LOCALAPPDATA%\yomiage）に MP3 一時ファイルを置く
+        # MP3 一時ファイルは OneDrive 外に置く
         tmp_dir = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "."))) / "yomiage"
         try:
             tmp_dir.mkdir(parents=True, exist_ok=True)
         except Exception as _e:
             log.warning(f"一時フォルダ作成失敗 → スクリプト隣を使用: {_e}")
             tmp_dir = Path(__file__).parent
-        generated_files: list[Path] = []
 
-        # ダブルバッファ: 2つの MCI エイリアスを交互に使う
-        _ALIASES = ("tts_0", "tts_1")
-        cur_alias  = _ALIASES[0]
-        next_alias = _ALIASES[1]
+        # 各チャンクの MP3 ファイルパス（重複防止に乱数を含める）
+        import uuid
+        _session_id = uuid.uuid4().hex[:8]
+        mp3_files = [tmp_dir / f"_tts_{_session_id}_{i}.mp3" for i in range(len(chunks))]
 
-        # 次チャンクの準備スレッド（MP3生成 + MCI open を並行実行）
-        prep_thread: threading.Thread | None = None
-        prep_mp3_ok:  list[bool] = [False]
-        prep_open_ok: list[bool] = [False]
+        # ---- バックグラウンド: 全チャンクの MP3 を順次生成 ----
+        # MCI には触れない（メインスレッドのみが MCI を扱う）
+        gen_done = [False] * len(chunks)
+        gen_lock = threading.Lock()
 
-        already_playing = False  # True = cur_alias は既に play 中
+        def _gen_worker():
+            for idx, ch in enumerate(chunks):
+                if self._stop_flag.is_set():
+                    return
+                ok = self._generate_mp3(ch, mp3_files[idx])
+                with gen_lock:
+                    gen_done[idx] = ok
+                if not ok:
+                    log.warning(f"チャンク {idx+1} 生成失敗")
 
-        def _cleanup_aliases() -> None:
-            for _a in _ALIASES:
-                _mci(f"stop {_a}")
-                _mci(f"close {_a}")
+        gen_thread = threading.Thread(target=_gen_worker, daemon=True)
+        gen_thread.start()
 
-        # ---- 開始ビープ（1回・同期）----
+        # ---- 開始ビープ ----
         try:
             winsound.PlaySound(_BEEP_WAV, winsound.SND_MEMORY)
         except Exception:
             pass
+
+        def _wait_chunk_ready(idx: int, timeout_s: float = 60.0) -> bool:
+            """指定チャンクの MP3 が生成完了するまで待つ"""
+            deadline = time.monotonic() + timeout_s
+            while not self._stop_flag.is_set() and time.monotonic() < deadline:
+                with gen_lock:
+                    if gen_done[idx]:
+                        return mp3_files[idx].exists() and mp3_files[idx].stat().st_size > 100
+                # ジェネレータースレッドが終了して未完なら失敗
+                if not gen_thread.is_alive():
+                    return mp3_files[idx].exists() and mp3_files[idx].stat().st_size > 100
+                time.sleep(0.05)
+            return False
 
         try:
             for i, chunk in enumerate(chunks):
@@ -671,51 +691,31 @@ class TTSEngine:
                     log.info("TTS 中断")
                     break
 
-                mp3_file = tmp_dir / f"_tts_chunk_{i}.mp3"
-                if mp3_file not in generated_files:
-                    generated_files.append(mp3_file)
-
-                # ---- MP3 生成 & MCI open ----
-                if already_playing:
-                    # 前イテレーションでスイッチ済み: 再生中なのでスキップ
-                    already_playing = False
-                elif prep_thread is not None:
-                    # 先読みスレッドの完了を待つ
-                    prep_thread.join(timeout=60)
-                    prep_thread = None
-                    ok = prep_mp3_ok[0]
+                # MP3 生成完了を待つ
+                if not _wait_chunk_ready(i):
                     if self._stop_flag.is_set():
                         break
-                    if not ok:
-                        # 生成失敗 → このチャンクをスキップして次へ
-                        log.warning(f"チャンク {i+1} の生成失敗。スキップします。")
-                        continue
-                    if not prep_open_ok[0]:
-                        # MP3 は生成済みだが MCI open が間に合わなかった → 今開く
-                        rc = _mci(f'open "{mp3_file}" type mpegvideo alias {cur_alias}')
-                        if rc != 0:
-                            log.error(f"MCI open 失敗 rc={rc}")
-                            continue
-                    rc = _mci(f"play {cur_alias}")
-                    if rc != 0:
-                        log.error(f"MCI play 失敗 rc={rc}")
-                        _mci(f"close {cur_alias}")
-                        continue
-                else:
-                    # 最初のチャンク: 生成
-                    ok = self._generate_mp3(chunk, mp3_file)
-                    if not ok or self._stop_flag.is_set():
-                        break
+                    log.warning(f"チャンク {i+1} の MP3 が未生成 → スキップ")
+                    continue
 
-                    rc = _mci(f'open "{mp3_file}" type mpegvideo alias {cur_alias}')
-                    if rc != 0:
-                        log.error(f"MCI open 失敗 rc={rc}")
-                        break
-                    rc = _mci(f"play {cur_alias}")
-                    if rc != 0:
-                        log.error(f"MCI play 失敗 rc={rc}")
-                        _mci(f"close {cur_alias}")
-                        break
+                mp3_file = mp3_files[i]
+
+                # 念のため前回の alias を閉じる
+                _mci("stop tts")
+                _mci("close tts")
+
+                # MCI open
+                rc = _mci(f'open "{mp3_file}" type mpegvideo alias tts')
+                if rc != 0:
+                    log.error(f"MCI open 失敗 rc={rc} → スキップ")
+                    continue
+
+                # MCI play
+                rc = _mci("play tts")
+                if rc != 0:
+                    log.error(f"MCI play 失敗 rc={rc} → スキップ")
+                    _mci("close tts")
+                    continue
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
@@ -730,56 +730,29 @@ class TTSEngine:
                     else:
                         self._overlay.update(title, chunk)
 
-                # ---- 次チャンクを並行して生成 + MCI open（ダブルバッファ準備）----
-                prep_mp3_ok  = [False]
-                prep_open_ok = [False]
-                prep_thread  = None
-
-                if i + 1 < len(chunks):
-                    next_mp3 = tmp_dir / f"_tts_chunk_{i + 1}.mp3"
-                    if next_mp3 not in generated_files:
-                        generated_files.append(next_mp3)
-                    _na = next_alias  # クロージャキャプチャ
-
-                    def _prep(txt=chunks[i + 1], path=next_mp3, alias=_na,
-                              p_ok=prep_mp3_ok, o_ok=prep_open_ok):
-                        p_ok[0] = self._generate_mp3(txt, path)
-                        if p_ok[0] and not self._stop_flag.is_set():
-                            rc = _mci(f'open "{path}" type mpegvideo alias {alias}')
-                            o_ok[0] = (rc == 0)
-
-                    prep_thread = threading.Thread(target=_prep, daemon=True)
-                    prep_thread.start()
-
-                # ---- 現チャンク再生完了待ち ----
-                # フェーズ1: MCI が "playing" 状態になるまで待つ（最大 2 秒）
-                _poll_deadline = time.monotonic() + 2.0
-                while not self._stop_flag.is_set() and time.monotonic() < _poll_deadline:
-                    if _mci_status(f"status {cur_alias} mode") == "playing":
+                # ---- 再生完了待ち ----
+                # フェーズ1: "playing" 状態になるまで待つ（最大 2 秒）
+                _p1_deadline = time.monotonic() + 2.0
+                while not self._stop_flag.is_set() and time.monotonic() < _p1_deadline:
+                    if _mci_status("status tts mode") == "playing":
                         break
                     time.sleep(0.02)
 
-                # フェーズ2: "playing" が終わるのを待つ
-                # MCI は play 直後に "playing" → 瞬時に "stopped" へ遷移する場合がある。
-                # 文字数から音声時間を推定し（日本語 TTS ≈ 80ms/文字）、
-                # その 90% を経過するまでは "not playing" でも終了しない。
+                # フェーズ2: 文字数ベースの推定時間 90% を最低保証して完了待ち
                 _estimated_s = max(len(chunk) * 0.08, 1.0)
-                _phase2_start = time.monotonic()
+                _p2_start = time.monotonic()
                 while not self._stop_flag.is_set():
-                    mode = _mci_status(f"status {cur_alias} mode")
-                    elapsed = time.monotonic() - _phase2_start
+                    mode = _mci_status("status tts mode")
+                    elapsed = time.monotonic() - _p2_start
                     if mode != "playing" and elapsed >= _estimated_s * 0.9:
                         break
                     time.sleep(0.05)
 
+                _mci("stop tts")
+                _mci("close tts")
+
                 if self._stop_flag.is_set():
                     log.info("TTS 中断（Esc/停止）")
-                    _mci(f"stop {cur_alias}")
-                    _mci(f"close {cur_alias}")
-                    if prep_thread:
-                        prep_thread.join(timeout=3)
-                        if prep_open_ok[0]:
-                            _mci(f"close {next_alias}")
                     break
 
                 # ---- Tab によるチャンク境界一時停止 ----
@@ -799,76 +772,18 @@ class TTSEngine:
                         self._tab_paused = False
                     if self._stop_flag.is_set():
                         log.info("TTS 中断（一時停止中に Esc）")
-                        _mci(f"stop {cur_alias}")
-                        _mci(f"close {cur_alias}")
-                        if prep_thread:
-                            prep_thread.join(timeout=3)
-                            if prep_open_ok[0]:
-                                _mci(f"close {next_alias}")
                         break
                     log.info("Tab 再開")
-
-                # ---- ダブルバッファ切り替え: 次チャンクへギャップなしで移行 ----
-                if i + 1 < len(chunks):
-                    if prep_thread is not None:
-                        prep_thread.join(timeout=60)
-                        prep_thread = None
-
-                    if self._stop_flag.is_set():
-                        _mci(f"stop {cur_alias}")
-                        _mci(f"close {cur_alias}")
-                        if prep_open_ok[0]:
-                            _mci(f"close {next_alias}")
-                        break
-
-                    next_mp3_path = tmp_dir / f"_tts_chunk_{i+1}.mp3"
-
-                    if prep_open_ok[0]:
-                        # next_alias は既に open 済み → 即座に play（ギャップほぼゼロ）
-                        rc_play = _mci(f"play {next_alias}")
-                        _mci(f"stop {cur_alias}")
-                        _mci(f"close {cur_alias}")
-                        cur_alias, next_alias = next_alias, cur_alias
-                        if rc_play == 0:
-                            already_playing = True
-                            log.info(f"ダブルバッファ切り替え チャンク {i+2}/{len(chunks)}")
-                        else:
-                            already_playing = False
-                            log.warning(f"ダブルバッファ play 失敗 rc={rc_play} → 次ループで再生成")
-                    elif prep_mp3_ok[0]:
-                        # MP3 は生成済みだが MCI open が未完 → 今 open して play
-                        _mci(f"stop {cur_alias}")
-                        _mci(f"close {cur_alias}")
-                        rc = _mci(f'open "{next_mp3_path}" type mpegvideo alias {next_alias}')
-                        if rc == 0:
-                            rc_play = _mci(f"play {next_alias}")
-                            if rc_play == 0:
-                                cur_alias, next_alias = next_alias, cur_alias
-                                already_playing = True
-                                log.info(f"遅延 open で切り替え チャンク {i+2}/{len(chunks)}")
-                            else:
-                                already_playing = False
-                                log.warning(f"遅延 play 失敗 rc={rc_play}")
-                        else:
-                            already_playing = False
-                    else:
-                        # 生成失敗 or 未完了 → 次ループで再試行
-                        _mci(f"stop {cur_alias}")
-                        _mci(f"close {cur_alias}")
-                        already_playing = False
-                        log.warning(f"チャンク {i+2} 先読み失敗（次ループで再生成）")
-                else:
-                    _mci(f"stop {cur_alias}")
-                    _mci(f"close {cur_alias}")
             else:
                 log.info("TTS 完了")
 
         except Exception as e:
             log.error(f"TTS エラー: {e}", exc_info=True)
         finally:
-            if prep_thread is not None:
-                prep_thread.join(timeout=3)
-            _cleanup_aliases()
+            self._stop_flag.set()  # ジェネレータースレッドを止める
+            _mci("stop tts")
+            _mci("close tts")
+            gen_thread.join(timeout=3)
             with self._tab_lock:
                 self._tab_pause_requested = False
                 self._tab_paused = False
@@ -879,7 +794,7 @@ class TTSEngine:
             self._done.set()
             if self._overlay is not None:
                 self._overlay.hide()
-            for f in generated_files:
+            for f in mp3_files:
                 try:
                     f.unlink(missing_ok=True)
                 except Exception:
