@@ -652,6 +652,12 @@ class TTSEngine:
                 _mci(f"stop {_a}")
                 _mci(f"close {_a}")
 
+        # ---- 開始ビープ（1回・同期）----
+        try:
+            winsound.PlaySound(_BEEP_WAV, winsound.SND_MEMORY)
+        except Exception:
+            pass
+
         try:
             for i, chunk in enumerate(chunks):
                 if self._stop_flag.is_set():
@@ -667,44 +673,30 @@ class TTSEngine:
                     # 前イテレーションでスイッチ済み: 再生中なのでスキップ
                     already_playing = False
                 elif prep_thread is not None:
-                    # 先読みスレッドが完了しているか待つ
+                    # 先読みスレッドの完了を待つ
                     prep_thread.join(timeout=60)
                     prep_thread = None
                     ok = prep_mp3_ok[0]
-                    if not ok or self._stop_flag.is_set():
+                    if self._stop_flag.is_set():
                         break
+                    if not ok:
+                        # 生成失敗 → このチャンクをスキップして次へ
+                        log.warning(f"チャンク {i+1} の生成失敗。スキップします。")
+                        continue
                     if not prep_open_ok[0]:
-                        # open が間に合わなかった場合のフォールバック
+                        # MP3 は生成済みだが MCI open が間に合わなかった → 今開く
                         rc = _mci(f'open "{mp3_file}" type mpegvideo alias {cur_alias}')
                         if rc != 0:
                             log.error(f"MCI open 失敗 rc={rc}")
-                            break
+                            continue
                     rc = _mci(f"play {cur_alias}")
                     if rc != 0:
                         log.error(f"MCI play 失敗 rc={rc}")
                         _mci(f"close {cur_alias}")
-                        break
+                        continue
                 else:
-                    # 最初のチャンク: ビープ音付き生成
-                    beep_stop = threading.Event()
-
-                    def _beep_loop():
-                        while not beep_stop.is_set():
-                            try:
-                                winsound.PlaySound(
-                                    _BEEP_WAV,
-                                    winsound.SND_MEMORY | winsound.SND_NOSTOP,
-                                )
-                            except Exception:
-                                pass
-                            beep_stop.wait(0.8)
-
-                    beep_thread = threading.Thread(target=_beep_loop, daemon=True)
-                    beep_thread.start()
+                    # 最初のチャンク: 生成
                     ok = self._generate_mp3(chunk, mp3_file)
-                    beep_stop.set()
-                    beep_thread.join(timeout=1)
-
                     if not ok or self._stop_flag.is_set():
                         break
 
@@ -800,7 +792,16 @@ class TTSEngine:
                         prep_thread.join(timeout=60)
                         prep_thread = None
 
-                    if prep_open_ok[0] and not self._stop_flag.is_set():
+                    if self._stop_flag.is_set():
+                        _mci(f"stop {cur_alias}")
+                        _mci(f"close {cur_alias}")
+                        if prep_open_ok[0]:
+                            _mci(f"close {next_alias}")
+                        break
+
+                    next_mp3_path = tmp_dir / f"_tts_chunk_{i+1}.mp3"
+
+                    if prep_open_ok[0]:
                         # next_alias は既に open 済み → 即座に play（ギャップほぼゼロ）
                         _mci(f"play {next_alias}")
                         _mci(f"stop {cur_alias}")
@@ -808,12 +809,24 @@ class TTSEngine:
                         cur_alias, next_alias = next_alias, cur_alias
                         already_playing = True
                         log.info(f"ダブルバッファ切り替え チャンク {i+2}/{len(chunks)}")
+                    elif prep_mp3_ok[0]:
+                        # MP3 は生成済みだが MCI open が未完 → 今 open して play
+                        _mci(f"stop {cur_alias}")
+                        _mci(f"close {cur_alias}")
+                        rc = _mci(f'open "{next_mp3_path}" type mpegvideo alias {next_alias}')
+                        if rc == 0:
+                            _mci(f"play {next_alias}")
+                            cur_alias, next_alias = next_alias, cur_alias
+                            already_playing = True
+                            log.info(f"遅延 open で切り替え チャンク {i+2}/{len(chunks)}")
+                        else:
+                            already_playing = False
                     else:
-                        # open が間に合わなかった → フォールバック（次ループで open/play）
+                        # 生成失敗 or 未完了 → 次ループで再試行
                         _mci(f"stop {cur_alias}")
                         _mci(f"close {cur_alias}")
                         already_playing = False
-                        log.warning(f"チャンク {i+2} 先読み間に合わず（フォールバック）")
+                        log.warning(f"チャンク {i+2} 先読み失敗（次ループで再生成）")
                 else:
                     _mci(f"stop {cur_alias}")
                     _mci(f"close {cur_alias}")
