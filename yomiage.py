@@ -745,6 +745,16 @@ class TTSEngine:
                     prep_thread.start()
 
                 # ---- 現チャンク再生完了待ち ----
+                # フェーズ1: MCI が "playing" 状態になるまで待つ（最大 2 秒）
+                # ダブルバッファ切り替え直後は play コマンド送信から
+                # "playing" 遷移まで数 ms の遅延があるためこのフェーズが必要
+                _poll_deadline = time.monotonic() + 2.0
+                while not self._stop_flag.is_set() and time.monotonic() < _poll_deadline:
+                    if _mci_status(f"status {cur_alias} mode") == "playing":
+                        break
+                    time.sleep(0.02)
+
+                # フェーズ2: "playing" が終わるのを待つ（再生完了 or 停止）
                 while not self._stop_flag.is_set():
                     if _mci_status(f"status {cur_alias} mode") != "playing":
                         break
