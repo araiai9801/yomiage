@@ -387,6 +387,27 @@ import re as _re
 # 文の区切りパターン（日本語の句点・感嘆符・疑問符・改行など）
 _SENTENCE_SPLIT = _re.compile(r'(?<=[。！？!?\n])\s*')
 
+# TTS に送る前に除去する不要記号
+# ボックス罫線・ブロック要素・装飾記号など edge-tts が読み上げられない文字
+_NOISE_CHARS = _re.compile(
+    r'['
+    r'─-╿'   # ボックス罫線（─ │ ┌ など）
+    r'▀-▟'   # ブロック要素（█ ▀ など）
+    r'■-◿'   # 幾何学図形（■ ▲ ● など）
+    r'☀-⛿'   # 各種記号（☀ ★ など）— 必要なら外してください
+    r'～'          # ～（全角チルダ）
+    r']+'
+)
+
+
+def _clean_for_tts(text: str) -> str:
+    """TTS に不要な記号を除去し、読み上げやすい形に整える"""
+    # 不要記号を空白に置換
+    cleaned = _NOISE_CHARS.sub(' ', text)
+    # 連続する空白・全角スペースを 1 つにまとめる
+    cleaned = _re.sub(r'[ 　]{2,}', ' ', cleaned).strip()
+    return cleaned
+
 # 短文を結合するときの上限文字数
 # 句点（。！？!?）ごとに分割し、この文字数に達するまで結合する。
 # 読点（、）での分割は _CHUNK_FORCE_SPLIT 超えの超長文にのみ使用。
@@ -541,6 +562,11 @@ class TTSEngine:
 
     def _generate_mp3(self, text: str, mp3_path: Path) -> bool:
         """edge-tts で MP3 を生成。成功なら True"""
+        # TTS に不適切な記号を除去してから送る
+        text = _clean_for_tts(text)
+        if not text:
+            log.warning("クリーニング後にテキストが空になりました。スキップします。")
+            return False
         proc = subprocess.Popen(
             [
                 self._get_python_exe(), "-m", "edge_tts",
@@ -592,7 +618,11 @@ class TTSEngine:
         _mci("close tts")
 
     def _speak(self, text: str) -> None:
-        chunks = _split_into_chunks(text)
+        # クリーニング後に空になるチャンク（罫線のみなど）を事前除外
+        chunks = [c for c in _split_into_chunks(text) if _clean_for_tts(c).strip()]
+        if not chunks:
+            log.info("読み上げ可能なテキストがありません")
+            return
         log.info(f"TTS 開始 ({len(text)} 文字, {len(chunks)} チャンク, {_TTS_VOICE})")
         self._speaking.set()
         self._stop_flag.clear()
