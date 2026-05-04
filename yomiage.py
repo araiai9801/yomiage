@@ -632,7 +632,14 @@ class TTSEngine:
             self._tab_paused = False
             self._tab_resume_event.clear()
 
-        tmp_dir = Path(__file__).parent
+        # OneDrive 同期フォルダだとファイルロックで edge-tts が書き込み失敗するため、
+        # 必ず OneDrive 外（%LOCALAPPDATA%\yomiage）に MP3 一時ファイルを置く
+        tmp_dir = Path(os.environ.get("LOCALAPPDATA", os.environ.get("TEMP", "."))) / "yomiage"
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as _e:
+            log.warning(f"一時フォルダ作成失敗 → スクリプト隣を使用: {_e}")
+            tmp_dir = Path(__file__).parent
         generated_files: list[Path] = []
 
         # ダブルバッファ: 2つの MCI エイリアスを交互に使う
