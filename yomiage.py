@@ -981,8 +981,27 @@ class HotkeyHandler:
 
         ok = user32.RegisterHotKey(None, _HOTKEY_READ, _MOD_CTRL_ALT, _VK_R)
         if not ok:
-            log.error("RegisterHotKey(Ctrl+Alt+R) 失敗")
-            return
+            log.warning("RegisterHotKey(Ctrl+Alt+R) 失敗 — 既存インスタンスを終了して再試行します")
+            # 同じ yomiage.py を実行中の古いプロセスを終了する
+            _current_pid = os.getpid()
+            try:
+                subprocess.run(
+                    ["wmic", "process", "where",
+                     f"(name='pythonw.exe' or name='python.exe')"
+                     f" and ProcessId!='{_current_pid}'"
+                     f" and CommandLine like '%yomiage%'",
+                     "delete"],
+                    capture_output=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            except Exception as _e:
+                log.warning(f"既存インスタンス終了試行: {_e}")
+            time.sleep(1.2)
+            ok = user32.RegisterHotKey(None, _HOTKEY_READ, _MOD_CTRL_ALT, _VK_R)
+            if not ok:
+                log.error("RegisterHotKey(Ctrl+Alt+R) 再試行も失敗 — 別アプリが使用中の可能性")
+                return
+            log.info("Ctrl+Alt+R を登録しました（古いインスタンス終了後に再登録）")
         log.info("Ctrl+Alt+R を登録しました")
 
         ok2 = user32.RegisterHotKey(None, _HOTKEY_READ_END, _MOD_CTRL_ALT, _VK_E)
