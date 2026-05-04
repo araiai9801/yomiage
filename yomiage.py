@@ -387,44 +387,44 @@ import re as _re
 # 文の区切りパターン（日本語の句点・感嘆符・疑問符・改行など）
 _SENTENCE_SPLIT = _re.compile(r'(?<=[。！？!?\n])\s*')
 
-# 1チャンクの最大文字数（これ以上は強制分割）
-_CHUNK_MAX_CHARS = 50
+# 短文を結合するときの上限文字数
+# 句点（。！？!?）ごとに分割し、この文字数に達するまで結合する。
+# 読点（、）での分割は _CHUNK_FORCE_SPLIT 超えの超長文にのみ使用。
+_CHUNK_MAX_CHARS   = 100   # 短文まとめ上限
+_CHUNK_FORCE_SPLIT = 150   # この長さを超える文節のみ読点で強制分割
 
 
 def _split_into_chunks(text: str) -> list[str]:
-    """テキストを文単位のチャンクに分割する"""
-    # まず文で分割
+    """テキストを文単位のチャンクに分割する。
+    分割は句点（。！？!?\\n）のみ。読点（、）は超長文の最終手段。
+    """
     sentences = _SENTENCE_SPLIT.split(text.strip())
     sentences = [s.strip() for s in sentences if s.strip()]
 
     if not sentences:
         return [text.strip()] if text.strip() else []
 
-    # 短い文はまとめる、長い文は分割
     chunks: list[str] = []
     current = ""
     for s in sentences:
-        if len(s) > _CHUNK_MAX_CHARS:
-            # 長い文: 現在のバッファを先にフラッシュ
+        if len(current) + len(s) > _CHUNK_MAX_CHARS:
             if current:
                 chunks.append(current)
-                current = ""
-            # 句読点なしの長文は読点で分割を試みる
-            parts = _re.split(r'(?<=[、,，])\s*', s)
-            sub = ""
-            for p in parts:
-                if len(sub) + len(p) > _CHUNK_MAX_CHARS and sub:
+            # 一文自体が非常に長い場合のみ読点で分割
+            if len(s) > _CHUNK_FORCE_SPLIT:
+                parts = _re.split(r'(?<=[、,，])\s*', s)
+                sub = ""
+                for p in parts:
+                    if len(sub) + len(p) > _CHUNK_FORCE_SPLIT and sub:
+                        chunks.append(sub)
+                        sub = p
+                    else:
+                        sub += p
+                if sub:
                     chunks.append(sub)
-                    sub = p
-                else:
-                    sub += p
-            if sub:
-                chunks.append(sub)
-        elif len(current) + len(s) > _CHUNK_MAX_CHARS:
-            # バッファがいっぱい → フラッシュ
-            if current:
-                chunks.append(current)
-            current = s
+                current = ""
+            else:
+                current = s
         else:
             current += s
     if current:
@@ -522,9 +522,10 @@ class TTSEngine:
                     log.info("edge-tts 生成プロセスを終了しました")
                 except Exception:
                     pass
-        # MCI 再生中なら即停止
-        _mci("stop tts")
-        _mci("close tts")
+        # MCI 再生中なら即停止（ダブルバッファ両エイリアス）
+        for _a in ("tts_0", "tts_1"):
+            _mci(f"stop {_a}")
+            _mci(f"close {_a}")
         self._speaking.clear()
 
     def stop(self) -> None:
@@ -596,7 +597,6 @@ class TTSEngine:
         self._speaking.set()
         self._stop_flag.clear()
 
-        # Tab 一時停止状態をリセット
         with self._tab_lock:
             self._tab_pause_requested = False
             self._tab_paused = False
@@ -605,9 +605,22 @@ class TTSEngine:
         tmp_dir = Path(__file__).parent
         generated_files: list[Path] = []
 
-        # 先読みスレッドをループをまたいで持ち越す
-        prefetch_thread: threading.Thread | None = None
-        prefetch_ok: list[bool] = [False]
+        # ダブルバッファ: 2つの MCI エイリアスを交互に使う
+        _ALIASES = ("tts_0", "tts_1")
+        cur_alias  = _ALIASES[0]
+        next_alias = _ALIASES[1]
+
+        # 次チャンクの準備スレッド（MP3生成 + MCI open を並行実行）
+        prep_thread: threading.Thread | None = None
+        prep_mp3_ok:  list[bool] = [False]
+        prep_open_ok: list[bool] = [False]
+
+        already_playing = False  # True = cur_alias は既に play 中
+
+        def _cleanup_aliases() -> None:
+            for _a in _ALIASES:
+                _mci(f"stop {_a}")
+                _mci(f"close {_a}")
 
         try:
             for i, chunk in enumerate(chunks):
@@ -619,12 +632,28 @@ class TTSEngine:
                 if mp3_file not in generated_files:
                     generated_files.append(mp3_file)
 
-                # ---- MP3 取得: 先読み済みなら待つだけ、なければ生成 ----
-                if prefetch_thread is not None:
-                    # 前チャンク再生中に並行生成済み → 完了待ちのみ
-                    prefetch_thread.join(timeout=60)
-                    ok = prefetch_ok[0]
-                    prefetch_thread = None
+                # ---- MP3 生成 & MCI open ----
+                if already_playing:
+                    # 前イテレーションでスイッチ済み: 再生中なのでスキップ
+                    already_playing = False
+                elif prep_thread is not None:
+                    # 先読みスレッドが完了しているか待つ
+                    prep_thread.join(timeout=60)
+                    prep_thread = None
+                    ok = prep_mp3_ok[0]
+                    if not ok or self._stop_flag.is_set():
+                        break
+                    if not prep_open_ok[0]:
+                        # open が間に合わなかった場合のフォールバック
+                        rc = _mci(f'open "{mp3_file}" type mpegvideo alias {cur_alias}')
+                        if rc != 0:
+                            log.error(f"MCI open 失敗 rc={rc}")
+                            break
+                    rc = _mci(f"play {cur_alias}")
+                    if rc != 0:
+                        log.error(f"MCI play 失敗 rc={rc}")
+                        _mci(f"close {cur_alias}")
+                        break
                 else:
                     # 最初のチャンク: ビープ音付き生成
                     beep_stop = threading.Event()
@@ -646,16 +675,24 @@ class TTSEngine:
                     beep_stop.set()
                     beep_thread.join(timeout=1)
 
-                if not ok or self._stop_flag.is_set():
-                    break
+                    if not ok or self._stop_flag.is_set():
+                        break
+
+                    rc = _mci(f'open "{mp3_file}" type mpegvideo alias {cur_alias}')
+                    if rc != 0:
+                        log.error(f"MCI open 失敗 rc={rc}")
+                        break
+                    rc = _mci(f"play {cur_alias}")
+                    if rc != 0:
+                        log.error(f"MCI play 失敗 rc={rc}")
+                        _mci(f"close {cur_alias}")
+                        break
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
-                # Ctrl+Alt+E の場合のみ: 読み上げ位置にスクロール
                 if self._source_hwnd:
                     _scroll_to_chunk(chunk, self._source_hwnd)
 
-                # オーバーレイを更新（現在のチャンクを表示）
                 self._current_chunk = chunk
                 if self._overlay is not None:
                     title = f"読み上げ中 {i+1}/{len(chunks)}"
@@ -664,23 +701,41 @@ class TTSEngine:
                     else:
                         self._overlay.update(title, chunk)
 
-                # ---- 現チャンク再生と並行して次チャンクを先読み生成 ----
-                prefetch_ok = [False]
-                prefetch_thread = None
+                # ---- 次チャンクを並行して生成 + MCI open（ダブルバッファ準備）----
+                prep_mp3_ok  = [False]
+                prep_open_ok = [False]
+                prep_thread  = None
+
                 if i + 1 < len(chunks):
                     next_mp3 = tmp_dir / f"_tts_chunk_{i + 1}.mp3"
-                    generated_files.append(next_mp3)
+                    if next_mp3 not in generated_files:
+                        generated_files.append(next_mp3)
+                    _na = next_alias  # クロージャキャプチャ
 
-                    def _prefetch(txt=chunks[i + 1], path=next_mp3, ok_ref=prefetch_ok):
-                        ok_ref[0] = self._generate_mp3(txt, path)
+                    def _prep(txt=chunks[i + 1], path=next_mp3, alias=_na,
+                              p_ok=prep_mp3_ok, o_ok=prep_open_ok):
+                        p_ok[0] = self._generate_mp3(txt, path)
+                        if p_ok[0] and not self._stop_flag.is_set():
+                            rc = _mci(f'open "{path}" type mpegvideo alias {alias}')
+                            o_ok[0] = (rc == 0)
 
-                    prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
-                    prefetch_thread.start()
+                    prep_thread = threading.Thread(target=_prep, daemon=True)
+                    prep_thread.start()
 
-                self._play_mp3(mp3_file)
+                # ---- 現チャンク再生完了待ち ----
+                while not self._stop_flag.is_set():
+                    if _mci_status(f"status {cur_alias} mode") != "playing":
+                        break
+                    time.sleep(0.05)
 
                 if self._stop_flag.is_set():
                     log.info("TTS 中断（Esc/停止）")
+                    _mci(f"stop {cur_alias}")
+                    _mci(f"close {cur_alias}")
+                    if prep_thread:
+                        prep_thread.join(timeout=3)
+                        if prep_open_ok[0]:
+                            _mci(f"close {next_alias}")
                     break
 
                 # ---- Tab によるチャンク境界一時停止 ----
@@ -695,24 +750,52 @@ class TTSEngine:
                     if self._overlay is not None:
                         self._overlay.update("⏸ 一時停止中 — Tab で再開", self._current_chunk)
                     log.info("Tab 一時停止（チャンク境界）")
-                    # Tab で再開 または Esc で stop_current() が set() するまで待機
                     self._tab_resume_event.wait()
                     with self._tab_lock:
                         self._tab_paused = False
                     if self._stop_flag.is_set():
                         log.info("TTS 中断（一時停止中に Esc）")
+                        _mci(f"stop {cur_alias}")
+                        _mci(f"close {cur_alias}")
+                        if prep_thread:
+                            prep_thread.join(timeout=3)
+                            if prep_open_ok[0]:
+                                _mci(f"close {next_alias}")
                         break
                     log.info("Tab 再開")
+
+                # ---- ダブルバッファ切り替え: 次チャンクへギャップなしで移行 ----
+                if i + 1 < len(chunks):
+                    if prep_thread is not None:
+                        prep_thread.join(timeout=60)
+                        prep_thread = None
+
+                    if prep_open_ok[0] and not self._stop_flag.is_set():
+                        # next_alias は既に open 済み → 即座に play（ギャップほぼゼロ）
+                        _mci(f"play {next_alias}")
+                        _mci(f"stop {cur_alias}")
+                        _mci(f"close {cur_alias}")
+                        cur_alias, next_alias = next_alias, cur_alias
+                        already_playing = True
+                        log.info(f"ダブルバッファ切り替え チャンク {i+2}/{len(chunks)}")
+                    else:
+                        # open が間に合わなかった → フォールバック（次ループで open/play）
+                        _mci(f"stop {cur_alias}")
+                        _mci(f"close {cur_alias}")
+                        already_playing = False
+                        log.warning(f"チャンク {i+2} 先読み間に合わず（フォールバック）")
+                else:
+                    _mci(f"stop {cur_alias}")
+                    _mci(f"close {cur_alias}")
             else:
                 log.info("TTS 完了")
 
         except Exception as e:
-            log.error(f"TTS エラー: {e}")
+            log.error(f"TTS エラー: {e}", exc_info=True)
         finally:
-            # 先読みスレッドのクリーンアップ
-            if prefetch_thread is not None:
-                prefetch_thread.join(timeout=5)
-            # Tab 停止状態を解除
+            if prep_thread is not None:
+                prep_thread.join(timeout=3)
+            _cleanup_aliases()
             with self._tab_lock:
                 self._tab_pause_requested = False
                 self._tab_paused = False
@@ -721,10 +804,8 @@ class TTSEngine:
                 self._gen_proc = None
             self._speaking.clear()
             self._done.set()
-            # オーバーレイを隠す
             if self._overlay is not None:
                 self._overlay.hide()
-            # 一時ファイル削除
             for f in generated_files:
                 try:
                     f.unlink(missing_ok=True)
