@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import io
+import json
 import logging
 import math
 import os
@@ -28,9 +29,20 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
+import urllib.error
 import wave
 import winsound
 from pathlib import Path
+
+# tomllib は Python 3.11+ 標準。3.10 以下なら tomli を試行
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore
 
 # ログ設定
 _LOG_PATH = Path(__file__).parent / "yomiage.log"
@@ -65,6 +77,7 @@ _VK_CONTROL       = 0x11
 _VK_C             = 0x43
 _VK_R             = 0x52
 _VK_E             = 0x45
+_VK_S             = 0x53
 _VK_T             = 0x54
 _VK_END           = 0x23
 _VK_ESCAPE        = 0x1B
@@ -81,6 +94,7 @@ _HOTKEY_READ      = 1
 _HOTKEY_READ_END  = 3   # Ctrl+Alt+E
 _HOTKEY_PAUSE     = 4   # Tab（読み上げ中のみ）
 _HOTKEY_TOGGLE_POS = 5  # Shift+Tab（読み上げ中のみ・オーバーレイ位置上下切替）
+_HOTKEY_SUMMARY   = 6   # Ctrl+Alt+S（生成AIで要約してから読み上げ）
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -270,6 +284,251 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
 
     except Exception as e:
         log.warning(f"チャンクスクロール失敗: {e}")
+
+
+# =====================================================================
+# Config — config.toml を読み込み（無ければデフォルト値で作成）
+# =====================================================================
+_CONFIG_PATH = Path(__file__).parent / "config.toml"
+
+# config.toml が存在しないときに書き出すデフォルト中身
+_DEFAULT_CONFIG_TOML = """\
+# =============================================================
+# yomiage 設定ファイル
+# =============================================================
+# このファイルを編集して保存後、yomiage を再起動すると反映されます。
+# # で始まる行はコメント（無視されます）。
+# =============================================================
+
+[summary]
+# -------------------------------------------------------------
+# 要約読み上げ機能（Ctrl+Alt+S で呼び出す）
+# -------------------------------------------------------------
+
+# 要約モードを有効にするか (true / false)
+enabled = true
+
+# 使用する AI プロバイダ
+#   "openai"    - OpenAI ChatGPT (推奨・最安・最速)
+#   "anthropic" - Anthropic Claude
+#   "gemini"    - Google Gemini (無料枠あり)
+#
+# それぞれ環境変数からAPIキーを読み込みます:
+#   openai    → OPENAI_API_KEY
+#   anthropic → ANTHROPIC_API_KEY
+#   gemini    → GEMINI_API_KEY
+provider = "openai"
+
+# モデル名
+# OpenAI:    "gpt-4o-mini" (推奨/安価) / "gpt-4o" (高品質)
+# Anthropic: "claude-haiku-4-5" / "claude-sonnet-4-5"
+# Gemini:    "gemini-2.0-flash" / "gemini-2.5-pro"
+model = "gpt-4o-mini"
+
+# 要約の長さ
+#   "short"  - 短く（元の30%程度）
+#   "medium" - 中程度（50%程度）★推奨
+#   "long"   - 詳しめ（70%程度）
+#   "bullet" - 要点を箇条書きで列挙
+length = "medium"
+
+# 追加の指示（オプション・空文字でもOK）
+# 例: "話し言葉で簡潔に" / "ビジネス調で" / "中学生にも分かるように"
+extra_instruction = "話し言葉で簡潔に"
+
+# API エラー / APIキー未設定時の動作
+#   "fallback" - 元のテキストをそのまま読み上げる ★推奨
+#   "skip"     - 何もしない（停止）
+on_error = "fallback"
+
+# API のタイムアウト秒数
+timeout_s = 30
+"""
+
+
+class Config:
+    """config.toml を読み込んで設定値を保持する"""
+
+    def __init__(self):
+        # デフォルト値
+        self.summary_enabled: bool = True
+        self.summary_provider: str = "openai"
+        self.summary_model: str = "gpt-4o-mini"
+        self.summary_length: str = "medium"
+        self.summary_extra_instruction: str = "話し言葉で簡潔に"
+        self.summary_on_error: str = "fallback"
+        self.summary_timeout_s: int = 30
+
+        # ファイルが無ければ作成
+        if not _CONFIG_PATH.exists():
+            try:
+                _CONFIG_PATH.write_text(_DEFAULT_CONFIG_TOML, encoding="utf-8")
+                log.info(f"デフォルト設定ファイルを作成: {_CONFIG_PATH}")
+            except Exception as e:
+                log.warning(f"config.toml 作成失敗: {e}")
+
+        # 読み込み
+        if tomllib is None:
+            log.warning("tomllib が利用できません。デフォルト設定を使用します。")
+            return
+        try:
+            with _CONFIG_PATH.open("rb") as f:
+                data = tomllib.load(f)
+            s = data.get("summary", {})
+            self.summary_enabled = bool(s.get("enabled", self.summary_enabled))
+            self.summary_provider = str(s.get("provider", self.summary_provider)).lower()
+            self.summary_model = str(s.get("model", self.summary_model))
+            self.summary_length = str(s.get("length", self.summary_length)).lower()
+            self.summary_extra_instruction = str(s.get("extra_instruction", self.summary_extra_instruction))
+            self.summary_on_error = str(s.get("on_error", self.summary_on_error)).lower()
+            self.summary_timeout_s = int(s.get("timeout_s", self.summary_timeout_s))
+            log.info(
+                f"設定読み込み完了: provider={self.summary_provider} "
+                f"model={self.summary_model} length={self.summary_length}"
+            )
+        except Exception as e:
+            log.warning(f"config.toml 読み込み失敗、デフォルト使用: {e}")
+
+
+# グローバル設定インスタンス
+_CONFIG = Config()
+
+
+# =====================================================================
+# SummaryEngine — 生成 AI でテキストを要約
+# =====================================================================
+class SummaryEngine:
+    """テキストを生成 AI で要約する。プロバイダごとに HTTP で API 呼び出し。"""
+
+    # 長さ別の指示
+    _LENGTH_INSTRUCTIONS = {
+        "short":  "元の文章を30%程度の長さに圧縮した要約",
+        "medium": "元の文章を50%程度の長さに圧縮した要約",
+        "long":   "元の文章を70%程度の長さに圧縮した要約",
+        "bullet": "重要なポイントを箇条書き（・）で列挙した要約",
+    }
+
+    def __init__(self, config: Config):
+        self._config = config
+
+    def is_available(self) -> tuple[bool, str]:
+        """要約機能が使える状態か (有効/APIキーあり) を確認"""
+        if not self._config.summary_enabled:
+            return False, "要約モードが無効です（config.toml の enabled=false）"
+        env_name = self._env_var_name()
+        if not env_name:
+            return False, f"未対応のプロバイダ: {self._config.summary_provider}"
+        if not os.environ.get(env_name):
+            return False, f"環境変数 {env_name} が設定されていません"
+        return True, ""
+
+    def _env_var_name(self) -> str:
+        m = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+        }
+        return m.get(self._config.summary_provider, "")
+
+    def _build_prompt(self, text: str) -> str:
+        length_instr = self._LENGTH_INSTRUCTIONS.get(
+            self._config.summary_length,
+            self._LENGTH_INSTRUCTIONS["medium"],
+        )
+        extra = self._config.summary_extra_instruction.strip()
+        extra_part = f"\n追加指示: {extra}" if extra else ""
+        return (
+            f"以下の日本語テキストを要約してください。\n"
+            f"形式: {length_instr}{extra_part}\n"
+            f"出力は要約本文のみ（前置き・解説・記号枠は不要）。\n\n"
+            f"--- 元のテキスト ---\n{text}\n--- ここまで ---"
+        )
+
+    def summarize(self, text: str) -> str | None:
+        """要約後のテキストを返す。失敗時は None。"""
+        ok, reason = self.is_available()
+        if not ok:
+            log.warning(f"要約スキップ: {reason}")
+            return None
+
+        prompt = self._build_prompt(text)
+        provider = self._config.summary_provider
+        try:
+            if provider == "openai":
+                return self._call_openai(prompt)
+            elif provider == "anthropic":
+                return self._call_anthropic(prompt)
+            elif provider == "gemini":
+                return self._call_gemini(prompt)
+            else:
+                log.warning(f"未対応のプロバイダ: {provider}")
+                return None
+        except Exception as e:
+            log.error(f"要約API呼び出し失敗: {e}")
+            return None
+
+    def _http_post_json(self, url: str, headers: dict, body: dict) -> dict:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=self._config.summary_timeout_s) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw)
+
+    def _call_openai(self, prompt: str) -> str | None:
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self._config.summary_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+        }
+        result = self._http_post_json(url, headers, body)
+        try:
+            return result["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError):
+            log.error(f"OpenAI 応答パース失敗: {str(result)[:300]}")
+            return None
+
+    def _call_anthropic(self, prompt: str) -> str | None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": self._config.summary_model,
+            "max_tokens": 2000,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        result = self._http_post_json(url, headers, body)
+        try:
+            parts = result.get("content", [])
+            for p in parts:
+                if p.get("type") == "text":
+                    return p.get("text", "").strip()
+            return None
+        except Exception:
+            log.error(f"Anthropic 応答パース失敗: {str(result)[:300]}")
+            return None
+
+    def _call_gemini(self, prompt: str) -> str | None:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        model = self._config.summary_model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        body = {"contents": [{"parts": [{"text": prompt}]}]}
+        result = self._http_post_json(url, headers, body)
+        try:
+            return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except (KeyError, IndexError):
+            log.error(f"Gemini 応答パース失敗: {str(result)[:300]}")
+            return None
 
 
 # =====================================================================
@@ -894,9 +1153,11 @@ _MSG_UNREGISTER_SHIFT_TAB  = _WM_USER + 6
 
 
 class HotkeyHandler:
-    def __init__(self, tts: TTSEngine, clipboard: ClipboardManager):
+    def __init__(self, tts: TTSEngine, clipboard: ClipboardManager,
+                 summary_engine: SummaryEngine | None = None):
         self._tts = tts
         self._clipboard = clipboard
+        self._summary = summary_engine
         self._lock = threading.Lock()
         self._thread_id: int | None = None
         self._esc_registered = False
@@ -976,6 +1237,12 @@ class HotkeyHandler:
         else:
             log.warning("RegisterHotKey(Ctrl+Alt+E) 失敗（他アプリが使用中の可能性）")
 
+        ok3 = user32.RegisterHotKey(None, _HOTKEY_SUMMARY, _MOD_CTRL_ALT, _VK_S)
+        if ok3:
+            log.info("Ctrl+Alt+S を登録しました（要約してから読み上げ）")
+        else:
+            log.warning("RegisterHotKey(Ctrl+Alt+S) 失敗（他アプリが使用中の可能性）")
+
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == _WM_HOTKEY:
@@ -1013,6 +1280,16 @@ class HotkeyHandler:
                     log.info("Shift+Tab → オーバーレイ上下切替")
                     if self._tts._overlay is not None:
                         self._tts._overlay.toggle_position()
+                elif msg.wParam == _HOTKEY_SUMMARY:
+                    if self._tts.is_speaking:
+                        log.info("Ctrl+Alt+S → 読み上げ停止")
+                        self._tts.stop_current()
+                        self._do_unregister_esc(user32)
+                    else:
+                        log.info("Ctrl+Alt+S → 要約読み上げ開始（選択テキスト）")
+                        t = threading.Thread(
+                            target=self._speak_selected_text_summary, daemon=True)
+                        t.start()
 
             elif msg.message == _MSG_REGISTER_ESC:
                 self._do_register_esc(user32)
@@ -1029,6 +1306,7 @@ class HotkeyHandler:
 
         user32.UnregisterHotKey(None, _HOTKEY_READ)
         user32.UnregisterHotKey(None, _HOTKEY_READ_END)
+        user32.UnregisterHotKey(None, _HOTKEY_SUMMARY)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
         if self._tab_registered:
@@ -1098,6 +1376,70 @@ class HotkeyHandler:
                 log.info("テキストが取得できませんでした")
         finally:
             self._lock.release()
+
+    def _speak_selected_text_summary(self) -> None:
+        """選択テキストを生成 AI で要約してから読み上げる"""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            time.sleep(0.3)
+            text = self._clipboard.get_selected_text()
+            if not text:
+                log.info("要約対象テキストが取得できませんでした")
+                return
+            log.info(f"要約対象: {text[:60]}{'...' if len(text) > 60 else ''} ({len(text)} 文字)")
+
+            if self._summary is None:
+                log.warning("要約エンジン未初期化")
+                return
+
+            ok, reason = self._summary.is_available()
+            if not ok:
+                log.warning(f"要約スキップ: {reason}")
+                # フォールバック判定
+                if self._summary._config.summary_on_error == "fallback":
+                    log.info("→ 元のテキストをそのまま読み上げます")
+                    self._speak_text_with_overlay(text)
+                else:
+                    # エラー内容を読み上げ
+                    self._speak_text_with_overlay(f"要約できませんでした。{reason}")
+                return
+
+            # オーバーレイに「要約中...」表示
+            overlay = getattr(self._tts, "_overlay", None)
+            if overlay is not None:
+                overlay.show("🤖 要約中...", "AI に問い合わせています。少々お待ちください。")
+
+            # 要約 API 呼び出し
+            t0 = time.monotonic()
+            summary = self._summary.summarize(text)
+            elapsed = time.monotonic() - t0
+            log.info(f"要約 API 応答時間: {elapsed:.2f}秒")
+
+            if not summary:
+                log.warning("要約失敗")
+                if overlay is not None:
+                    overlay.hide()
+                if self._summary._config.summary_on_error == "fallback":
+                    log.info("→ 元のテキストをそのまま読み上げます")
+                    self._speak_text_with_overlay(text)
+                return
+
+            log.info(f"要約結果 ({len(summary)} 文字): {summary[:80]}{'...' if len(summary) > 80 else ''}")
+            self._speak_text_with_overlay(summary)
+        finally:
+            self._lock.release()
+
+    def _speak_text_with_overlay(self, text: str) -> None:
+        """共通: テキストを Esc/Tab/Shift+Tab ホットキー登録付きで読み上げる"""
+        self._register_esc()
+        self._register_tab()
+        self._register_shift_tab()
+        self._tts.speak(text)
+        self._tts.wait_done()
+        self._unregister_esc()
+        self._unregister_tab()
+        self._unregister_shift_tab()
 
     def _speak_from_cursor(self, hwnd: int = 0) -> None:
         if not self._lock.acquire(blocking=False):
@@ -1197,7 +1539,8 @@ if __name__ == "__main__":
         overlay = OverlayWindow()
         tts = TTSEngine(overlay)
         clipboard = ClipboardManager()
-        hotkey = HotkeyHandler(tts, clipboard)
+        summary_engine = SummaryEngine(_CONFIG)
+        hotkey = HotkeyHandler(tts, clipboard, summary_engine)
         app = TrayApp(tts, hotkey)
         app.run()
     except Exception:
