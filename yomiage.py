@@ -65,6 +65,7 @@ _VK_CONTROL       = 0x11
 _VK_C             = 0x43
 _VK_R             = 0x52
 _VK_E             = 0x45
+_VK_T             = 0x54
 _VK_END           = 0x23
 _VK_ESCAPE        = 0x1B
 
@@ -78,6 +79,7 @@ _WM_USER          = 0x0400
 _HOTKEY_READ      = 1
 _HOTKEY_READ_END  = 3   # Ctrl+Alt+E
 _HOTKEY_PAUSE     = 4   # Tab（読み上げ中のみ）
+_HOTKEY_TOGGLE_POS = 5  # Ctrl+Alt+T（オーバーレイ位置 上下切替）
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -273,10 +275,11 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
 # OverlayWindow — 読み上げ中のテキストを画面下部に表示
 # =====================================================================
 class OverlayWindow:
-    """読み上げ中のチャンクを画面下部に表示する常に最前面のオーバーレイ"""
+    """読み上げ中のチャンクを画面下部 or 上部に表示する常に最前面のオーバーレイ"""
 
     def __init__(self):
         self._queue: queue.Queue = queue.Queue()
+        self._position = "bottom"  # "bottom" or "top"
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -288,13 +291,20 @@ class OverlayWindow:
         root.attributes("-alpha", 0.88)
         root.configure(bg="#1a1a1a")
 
-        # 画面下部中央に配置
+        # 画面サイズ
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
         w, h = min(1000, screen_w - 100), 120
         x = (screen_w - w) // 2
-        y = screen_h - h - 80
-        root.geometry(f"{w}x{h}+{x}+{y}")
+
+        def _apply_position(pos: str):
+            if pos == "top":
+                y = 40
+            else:
+                y = screen_h - h - 80
+            root.geometry(f"{w}x{h}+{x}+{y}")
+
+        _apply_position("bottom")
 
         # タイトル行
         title_lbl = tk.Label(
@@ -329,6 +339,11 @@ class OverlayWindow:
                         text_lbl.config(text=b)
                     elif action == "hide":
                         root.withdraw()
+                    elif action == "toggle_position":
+                        new_pos = "top" if self._position == "bottom" else "bottom"
+                        self._position = new_pos
+                        _apply_position(new_pos)
+                        log.info(f"オーバーレイ位置を{new_pos}に変更")
             except queue.Empty:
                 pass
             root.after(50, poll)
@@ -344,6 +359,10 @@ class OverlayWindow:
 
     def hide(self) -> None:
         self._queue.put(("hide", "", ""))
+
+    def toggle_position(self) -> None:
+        """オーバーレイの位置を上下で切り替える"""
+        self._queue.put(("toggle_position", "", ""))
 
 
 # =====================================================================
@@ -941,6 +960,12 @@ class HotkeyHandler:
         else:
             log.warning("RegisterHotKey(Ctrl+Alt+E) 失敗（他アプリが使用中の可能性）")
 
+        ok3 = user32.RegisterHotKey(None, _HOTKEY_TOGGLE_POS, _MOD_CTRL_ALT, _VK_T)
+        if ok3:
+            log.info("Ctrl+Alt+T を登録しました（オーバーレイ上下切替）")
+        else:
+            log.warning("RegisterHotKey(Ctrl+Alt+T) 失敗（他アプリが使用中の可能性）")
+
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == _WM_HOTKEY:
@@ -973,6 +998,10 @@ class HotkeyHandler:
                 elif msg.wParam == _HOTKEY_PAUSE:
                     log.info("Tab → チャンク境界一時停止/再開")
                     self._tts.toggle_tab_pause()
+                elif msg.wParam == _HOTKEY_TOGGLE_POS:
+                    log.info("Ctrl+Alt+T → オーバーレイ上下切替")
+                    if self._tts._overlay is not None:
+                        self._tts._overlay.toggle_position()
 
             elif msg.message == _MSG_REGISTER_ESC:
                 self._do_register_esc(user32)
@@ -985,6 +1014,7 @@ class HotkeyHandler:
 
         user32.UnregisterHotKey(None, _HOTKEY_READ)
         user32.UnregisterHotKey(None, _HOTKEY_READ_END)
+        user32.UnregisterHotKey(None, _HOTKEY_TOGGLE_POS)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
         if self._tab_registered:
