@@ -71,6 +71,7 @@ _VK_ESCAPE        = 0x1B
 
 _MOD_ALT          = 0x0001
 _MOD_CONTROL      = 0x0002
+_MOD_SHIFT        = 0x0004
 _MOD_CTRL_ALT     = _MOD_ALT | _MOD_CONTROL
 
 _WM_HOTKEY        = 0x0312
@@ -79,7 +80,7 @@ _WM_USER          = 0x0400
 _HOTKEY_READ      = 1
 _HOTKEY_READ_END  = 3   # Ctrl+Alt+E
 _HOTKEY_PAUSE     = 4   # Tab（読み上げ中のみ）
-_HOTKEY_TOGGLE_POS = 5  # Ctrl+Alt+T（オーバーレイ位置 上下切替）
+_HOTKEY_TOGGLE_POS = 5  # Shift+Tab（読み上げ中のみ・オーバーレイ位置上下切替）
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -884,10 +885,12 @@ class ClipboardManager:
 # HotkeyHandler — Ctrl+Alt+R + Esc (読み上げ中のみ動的に登録/解除)
 # =====================================================================
 _HOTKEY_ESC = 2
-_MSG_REGISTER_ESC    = _WM_USER + 1
-_MSG_UNREGISTER_ESC  = _WM_USER + 2
-_MSG_REGISTER_TAB    = _WM_USER + 3
-_MSG_UNREGISTER_TAB  = _WM_USER + 4
+_MSG_REGISTER_ESC          = _WM_USER + 1
+_MSG_UNREGISTER_ESC        = _WM_USER + 2
+_MSG_REGISTER_TAB          = _WM_USER + 3
+_MSG_UNREGISTER_TAB        = _WM_USER + 4
+_MSG_REGISTER_SHIFT_TAB    = _WM_USER + 5
+_MSG_UNREGISTER_SHIFT_TAB  = _WM_USER + 6
 
 
 class HotkeyHandler:
@@ -898,6 +901,7 @@ class HotkeyHandler:
         self._thread_id: int | None = None
         self._esc_registered = False
         self._tab_registered = False
+        self._shift_tab_registered = False
 
     def register(self) -> None:
         t = threading.Thread(target=self._hotkey_loop, daemon=True)
@@ -924,6 +928,18 @@ class HotkeyHandler:
         if self._thread_id:
             ctypes.windll.user32.PostThreadMessageW(
                 self._thread_id, _MSG_UNREGISTER_TAB, 0, 0)
+
+    def _register_shift_tab(self) -> None:
+        """ホットキースレッドに Shift+Tab 登録を依頼"""
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, _MSG_REGISTER_SHIFT_TAB, 0, 0)
+
+    def _unregister_shift_tab(self) -> None:
+        """ホットキースレッドに Shift+Tab 解除を依頼"""
+        if self._thread_id:
+            ctypes.windll.user32.PostThreadMessageW(
+                self._thread_id, _MSG_UNREGISTER_SHIFT_TAB, 0, 0)
 
     def _hotkey_loop(self) -> None:
         user32 = ctypes.windll.user32
@@ -960,12 +976,6 @@ class HotkeyHandler:
         else:
             log.warning("RegisterHotKey(Ctrl+Alt+E) 失敗（他アプリが使用中の可能性）")
 
-        ok3 = user32.RegisterHotKey(None, _HOTKEY_TOGGLE_POS, _MOD_CTRL_ALT, _VK_T)
-        if ok3:
-            log.info("Ctrl+Alt+T を登録しました（オーバーレイ上下切替）")
-        else:
-            log.warning("RegisterHotKey(Ctrl+Alt+T) 失敗（他アプリが使用中の可能性）")
-
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == _WM_HOTKEY:
@@ -995,11 +1005,12 @@ class HotkeyHandler:
                     self._tts.stop_current()
                     self._do_unregister_esc(user32)
                     self._do_unregister_tab(user32)
+                    self._do_unregister_shift_tab(user32)
                 elif msg.wParam == _HOTKEY_PAUSE:
                     log.info("Tab → チャンク境界一時停止/再開")
                     self._tts.toggle_tab_pause()
                 elif msg.wParam == _HOTKEY_TOGGLE_POS:
-                    log.info("Ctrl+Alt+T → オーバーレイ上下切替")
+                    log.info("Shift+Tab → オーバーレイ上下切替")
                     if self._tts._overlay is not None:
                         self._tts._overlay.toggle_position()
 
@@ -1011,14 +1022,19 @@ class HotkeyHandler:
                 self._do_register_tab(user32)
             elif msg.message == _MSG_UNREGISTER_TAB:
                 self._do_unregister_tab(user32)
+            elif msg.message == _MSG_REGISTER_SHIFT_TAB:
+                self._do_register_shift_tab(user32)
+            elif msg.message == _MSG_UNREGISTER_SHIFT_TAB:
+                self._do_unregister_shift_tab(user32)
 
         user32.UnregisterHotKey(None, _HOTKEY_READ)
         user32.UnregisterHotKey(None, _HOTKEY_READ_END)
-        user32.UnregisterHotKey(None, _HOTKEY_TOGGLE_POS)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
         if self._tab_registered:
             user32.UnregisterHotKey(None, _HOTKEY_PAUSE)
+        if self._shift_tab_registered:
+            user32.UnregisterHotKey(None, _HOTKEY_TOGGLE_POS)
 
     def _do_register_esc(self, user32) -> None:
         if not self._esc_registered:
@@ -1048,6 +1064,20 @@ class HotkeyHandler:
             self._tab_registered = False
             log.info("Tab ホットキー解除")
 
+    def _do_register_shift_tab(self, user32) -> None:
+        if not self._shift_tab_registered:
+            if user32.RegisterHotKey(None, _HOTKEY_TOGGLE_POS, _MOD_SHIFT, _VK_TAB):
+                self._shift_tab_registered = True
+                log.info("Shift+Tab ホットキー登録（オーバーレイ上下切替）")
+            else:
+                log.warning("Shift+Tab ホットキー登録失敗（他アプリが使用中の可能性）")
+
+    def _do_unregister_shift_tab(self, user32) -> None:
+        if self._shift_tab_registered:
+            user32.UnregisterHotKey(None, _HOTKEY_TOGGLE_POS)
+            self._shift_tab_registered = False
+            log.info("Shift+Tab ホットキー解除")
+
     def _speak_selected_text(self) -> None:
         if not self._lock.acquire(blocking=False):
             return
@@ -1058,10 +1088,12 @@ class HotkeyHandler:
                 log.info(f"読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
                 self._register_tab()
+                self._register_shift_tab()
                 self._tts.speak(text)
                 self._tts.wait_done()
                 self._unregister_esc()
                 self._unregister_tab()
+                self._unregister_shift_tab()
             else:
                 log.info("テキストが取得できませんでした")
         finally:
@@ -1088,10 +1120,12 @@ class HotkeyHandler:
                 log.info(f"カーソルから末尾まで読み上げ: {text[:60]}{'...' if len(text) > 60 else ''}")
                 self._register_esc()
                 self._register_tab()
+                self._register_shift_tab()
                 self._tts.speak(text, source_hwnd=hwnd)   # hwnd を渡してスクロール有効化
                 self._tts.wait_done()
                 self._unregister_esc()
                 self._unregister_tab()
+                self._unregister_shift_tab()
             else:
                 log.info("カーソル位置からテキストが取得できませんでした")
         finally:
