@@ -246,8 +246,10 @@ def _is_chromium_browser(hwnd: int) -> bool:
     return "Chrome_WidgetWin" in buf.value
 
 
-def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
-    """Chromium 系ブラウザ限定: Ctrl+F でチャンク先頭へスクロール。
+def _scroll_to_chunk(chunk_text: str, hwnd: int, keyword_max: int = 200) -> None:
+    """Chromium 系ブラウザ限定: Ctrl+F でチャンク該当部分をハイライト+スクロール。
+    keyword_max: 検索キーワードの最大文字数。長いほどハイライト範囲が広い。
+    短い文字数だと先頭しかハイライトされないので、要約モードでは長めに渡す。
     【重要】Escape を送信しない — SendInput の Escape が RegisterHotKey の
     「Esc=停止」を誤発動させるため。Find バーは開いたままにする。
     Word・メモ帳等ではスキップ（Ctrl+F の挙動が異なり干渉するため）。"""
@@ -259,7 +261,10 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int) -> None:
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.15)
 
-        keyword = chunk_text.strip()[:20]
+        # 改行・連続空白を1スペースに正規化（DOM とのマッチ率を上げる）
+        raw = chunk_text.strip()
+        import re as _re
+        keyword = _re.sub(r'\s+', ' ', raw)[:keyword_max]
         if not keyword:
             return
         pyperclip.copy(keyword)
@@ -1604,18 +1609,24 @@ class HotkeyHandler:
                         overlay.update(section_title, summary_text[:120] + (" …" if len(summary_text) > 120 else ""))
 
                     # 元セクションを「再生チャンク数」と同数に分割して、
-                    # 要約再生チャンク i に対して元セクションの i 番目を Ctrl+F でハイライト。
-                    # 要約再生チャンクの数は事前に分からないので、コールバック内で動的に計算する。
+                    # 要約再生チャンク i に対して元セクションの i 番目の部分（全体）を
+                    # Ctrl+F でハイライトする。Chromium の検索は数百字でも一致するので、
+                    # 該当部分まるごとを検索キーにすることで広範囲のハイライトを実現。
                     def _on_chunk(idx: int, total: int, chunk_text: str,
                                   _orig=orig_section, _hwnd=hwnd):
                         if not _hwnd or not _orig:
                             return
-                        # 元セクションを total 等分し、idx 番目の部分の先頭 30 字を検索キーに
-                        size = max(20, len(_orig) // max(1, total))
-                        start = min(idx * size, max(0, len(_orig) - 30))
-                        sample = _orig[start:start + 50].strip()
-                        if sample:
-                            _scroll_to_chunk(sample, _hwnd)
+                        # 元セクションを total 等分。idx 番目のスライス全体を検索キーに。
+                        size = max(40, len(_orig) // max(1, total))
+                        start = idx * size
+                        end = min(start + size, len(_orig))
+                        # 最後のチャンクは末尾までカバー
+                        if idx == total - 1:
+                            end = len(_orig)
+                        part = _orig[start:end].strip()
+                        if part:
+                            # keyword_max を高めに（最大 250字）して該当部分が広く一致するように
+                            _scroll_to_chunk(part, _hwnd, keyword_max=250)
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
                     # source_hwnd は 0（通常スクロールは無効化）、カスタムコールバック使用。
                     self._tts.speak(summary_text, on_chunk_start=_on_chunk)
