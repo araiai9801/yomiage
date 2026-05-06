@@ -865,6 +865,7 @@ class TTSEngine:
         self._done = threading.Event()
         self._done.set()
         self._source_hwnd: int = 0             # Ctrl+Alt+E 発火時のウィンドウ
+        self._on_chunk_start = None            # (i, n, chunk) を受け取るオプションコールバック
         self._current_chunk: str = ""          # 一時停止時の表示用
         self._python_exe: str | None = None
         # ---- Tab チャンク境界一時停止 ----
@@ -887,7 +888,12 @@ class TTSEngine:
     def is_speaking(self) -> bool:
         return self._speaking.is_set()
 
-    def speak(self, text: str, source_hwnd: int = 0) -> None:
+    def speak(self, text: str, source_hwnd: int = 0,
+              on_chunk_start=None) -> None:
+        """text を読み上げる。
+        on_chunk_start: 各再生チャンク開始時に on_chunk_start(i, n, chunk_text) が呼ばれる。
+        要約読み上げで、元文書の該当部分をハイライトするのに使う。
+        """
         if not text.strip():
             return
         while not self._queue.empty():
@@ -896,6 +902,7 @@ class TTSEngine:
             except queue.Empty:
                 break
         self._source_hwnd = source_hwnd
+        self._on_chunk_start = on_chunk_start
         self._done.clear()
         self._queue.put(text)
 
@@ -1119,7 +1126,14 @@ class TTSEngine:
 
                 log.info(f"チャンク {i+1}/{len(chunks)} 再生 ({len(chunk)} 文字)")
 
-                if self._source_hwnd:
+                # 要約モードのカスタムハイライト（元セクションの該当部分を進める）
+                if self._on_chunk_start is not None:
+                    try:
+                        self._on_chunk_start(i, len(chunks), chunk)
+                    except Exception as _e:
+                        log.warning(f"on_chunk_start コールバックエラー: {_e}")
+                elif self._source_hwnd:
+                    # 通常モード: チャンク自身の文字列を元文書から検索してハイライト
                     _scroll_to_chunk(chunk, self._source_hwnd)
 
                 self._current_chunk = chunk
@@ -1578,10 +1592,6 @@ class HotkeyHandler:
                         f"セクション {i+1}/{n} 読み上げ "
                         f"(元={len(orig_section)}文字, 要約={len(summary_text)}文字)"
                     )
-                    # 元文書の該当箇所をハイライト（Chromium 系ブラウザのみ）
-                    # _scroll_to_chunk が orig_section の先頭 20 字で Ctrl+F → 検索
-                    if hwnd:
-                        _scroll_to_chunk(orig_section, hwnd)
                     # 上段にセクション番号のみコンパクト表示（位置確認はハイライトで）
                     if overlay is not None:
                         ctx_label = (
@@ -1592,8 +1602,23 @@ class HotkeyHandler:
                         # 下段の古い「要約中...」表示を即座に置き換え（MP3生成中の沈黙対策）
                         section_title = f"📝 要約 {i+1}/{n} 準備中..." if n > 1 else "📝 要約 準備中..."
                         overlay.update(section_title, summary_text[:120] + (" …" if len(summary_text) > 120 else ""))
+
+                    # 元セクションを「再生チャンク数」と同数に分割して、
+                    # 要約再生チャンク i に対して元セクションの i 番目を Ctrl+F でハイライト。
+                    # 要約再生チャンクの数は事前に分からないので、コールバック内で動的に計算する。
+                    def _on_chunk(idx: int, total: int, chunk_text: str,
+                                  _orig=orig_section, _hwnd=hwnd):
+                        if not _hwnd or not _orig:
+                            return
+                        # 元セクションを total 等分し、idx 番目の部分の先頭 30 字を検索キーに
+                        size = max(20, len(_orig) // max(1, total))
+                        start = min(idx * size, max(0, len(_orig) - 30))
+                        sample = _orig[start:start + 50].strip()
+                        if sample:
+                            _scroll_to_chunk(sample, _hwnd)
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
-                    self._tts.speak(summary_text)
+                    # source_hwnd は 0（通常スクロールは無効化）、カスタムコールバック使用。
+                    self._tts.speak(summary_text, on_chunk_start=_on_chunk)
                     self._tts.wait_done()
             finally:
                 self._unregister_esc()
