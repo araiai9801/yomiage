@@ -1208,8 +1208,12 @@ class TTSEngine:
 
         except Exception as e:
             log.error(f"TTS エラー: {e}", exc_info=True)
+            self._stop_flag.set()  # 例外時のみジェネレータースレッドを止める
         finally:
-            self._stop_flag.set()  # ジェネレータースレッドを止める
+            # 注意: 正常終了時は _stop_flag.set() を呼ばない。
+            # 呼ぶと、要約読み上げのセクションループが「中断」と誤認して
+            # 2セクション目以降が実行されなくなる。
+            # ジェネレータースレッドは全チャンク生成し終えれば自然に終了する。
             _mci("stop tts")
             _mci("close tts")
             gen_thread.join(timeout=3)
