@@ -1583,6 +1583,11 @@ class HotkeyHandler:
                             if n > 1 else "📄 元の文章"
                         )
                         overlay.set_context(ctx_label, ctx)
+                        # 下段の古い「要約中...」表示をすぐに置き換える。
+                        # MP3 生成に数秒かかるので、その間「音声準備中」を表示。
+                        # （実際の再生開始時に _speak 内で再度 update される）
+                        section_title = f"📝 要約 {i+1}/{n} 準備中..." if n > 1 else "📝 要約 準備中..."
+                        overlay.update(section_title, summary_text[:200] + (" …" if len(summary_text) > 200 else ""))
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
                     self._tts.speak(summary_text)
                     self._tts.wait_done()
