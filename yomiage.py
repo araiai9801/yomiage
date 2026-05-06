@@ -606,7 +606,9 @@ class OverlayWindow:
 
     # 1段モード（通常）と 2段モード（要約: 上=元セクション、下=読み上げ中）の高さ
     _H_SINGLE = 120
-    _H_DUAL   = 260
+    _H_DUAL   = 280
+    # 2段モードでの上段固定高さ（残りが下段になる）
+    _H_CONTEXT = 110
 
     def _run(self):
         root = tk.Tk()
@@ -634,20 +636,22 @@ class OverlayWindow:
             root.geometry(f"{w}x{h}+{x}+{y}")
 
         # ---------- 上段: コンテキスト（要約モードで使用） ----------
-        context_frame = tk.Frame(root, bg="#0d0d0d")  # 少し暗い背景で区別
+        # 高さを固定して、長文が下段を押し出さないようにする
+        context_frame = tk.Frame(root, bg="#0d0d0d", height=self._H_CONTEXT)
+        context_frame.pack_propagate(False)  # 中身に応じて伸縮しないようにする
         context_title_lbl = tk.Label(
-            context_frame, text="", font=("Meiryo", 10),
+            context_frame, text="", font=("Meiryo", 11, "bold"),
             fg="#ffaa00", bg="#0d0d0d", anchor="w",
         )
-        context_title_lbl.pack(fill="x", padx=15, pady=(8, 0))
+        context_title_lbl.pack(fill="x", padx=15, pady=(6, 0))
         context_text_lbl = tk.Label(
-            context_frame, text="", font=("Meiryo", 11),
+            context_frame, text="", font=("Meiryo", 12),
             fg="#cccccc", bg="#0d0d0d", wraplength=w - 30,
             justify="left", anchor="nw",
         )
-        context_text_lbl.pack(expand=True, fill="both", padx=15, pady=(4, 8))
+        context_text_lbl.pack(expand=True, fill="both", padx=15, pady=(2, 6))
         # 区切り線
-        divider = tk.Frame(root, bg="#444444", height=1)
+        divider = tk.Frame(root, bg="#666666", height=2)
 
         # ---------- 下段: 通常表示（読み上げ中の文） ----------
         main_frame = tk.Frame(root, bg="#1a1a1a")
@@ -1574,10 +1578,11 @@ class HotkeyHandler:
                         f"セクション {i+1}/{n} 読み上げ "
                         f"(元={len(orig_section)}文字, 要約={len(summary_text)}文字)"
                     )
-                    # 上段に元セクションを表示（長すぎる場合は先頭400文字 + …）
+                    # 上段に元セクションを表示
+                    # 上段は高さ固定なので、文字数も短めに（先頭160字程度）抑える
                     if overlay is not None:
-                        ctx = orig_section if len(orig_section) <= 400 \
-                            else orig_section[:400] + " …"
+                        ctx = orig_section if len(orig_section) <= 160 \
+                            else orig_section[:160] + " …"
                         ctx_label = (
                             f"📄 元のセクション {i+1}/{n}"
                             if n > 1 else "📄 元の文章"
@@ -1587,7 +1592,7 @@ class HotkeyHandler:
                         # MP3 生成に数秒かかるので、その間「音声準備中」を表示。
                         # （実際の再生開始時に _speak 内で再度 update される）
                         section_title = f"📝 要約 {i+1}/{n} 準備中..." if n > 1 else "📝 要約 準備中..."
-                        overlay.update(section_title, summary_text[:200] + (" …" if len(summary_text) > 200 else ""))
+                        overlay.update(section_title, summary_text[:120] + (" …" if len(summary_text) > 120 else ""))
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
                     self._tts.speak(summary_text)
                     self._tts.wait_done()
