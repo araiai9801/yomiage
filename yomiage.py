@@ -343,6 +343,14 @@ on_error = "fallback"
 
 # API のタイムアウト秒数
 timeout_s = 30
+
+# 要約処理チャンクの最大文字数
+# 長文を 1 回で要約させると AI が極端に短くまとめがち。
+# このサイズで区切って AI に渡し、各部分の要約を連結する。
+#   小さくする (例: 800)  → 詳細が残る・APIコールが増える
+#   大きくする (例: 3000) → コール少ないが圧縮されすぎる
+#   推奨: 1500
+chunk_chars = 1500
 """
 
 
@@ -358,6 +366,8 @@ class Config:
         self.summary_extra_instruction: str = "話し言葉で簡潔に"
         self.summary_on_error: str = "fallback"
         self.summary_timeout_s: int = 30
+        # 要約処理の単位（文字数）。長文時にこの単位で区切って AI に渡す。
+        self.summary_chunk_chars: int = 1500
 
         # ファイルが無ければ作成
         if not _CONFIG_PATH.exists():
@@ -382,9 +392,11 @@ class Config:
             self.summary_extra_instruction = str(s.get("extra_instruction", self.summary_extra_instruction))
             self.summary_on_error = str(s.get("on_error", self.summary_on_error)).lower()
             self.summary_timeout_s = int(s.get("timeout_s", self.summary_timeout_s))
+            self.summary_chunk_chars = int(s.get("chunk_chars", self.summary_chunk_chars))
             log.info(
                 f"設定読み込み完了: provider={self.summary_provider} "
-                f"model={self.summary_model} length={self.summary_length}"
+                f"model={self.summary_model} length={self.summary_length} "
+                f"chunk_chars={self.summary_chunk_chars}"
             )
         except Exception as e:
             log.warning(f"config.toml 読み込み失敗、デフォルト使用: {e}")
@@ -430,28 +442,82 @@ class SummaryEngine:
         }
         return m.get(self._config.summary_provider, "")
 
-    def _build_prompt(self, text: str) -> str:
+    def _build_prompt(self, text: str, is_part: bool = False) -> str:
         length_instr = self._LENGTH_INSTRUCTIONS.get(
             self._config.summary_length,
             self._LENGTH_INSTRUCTIONS["medium"],
         )
         extra = self._config.summary_extra_instruction.strip()
         extra_part = f"\n追加指示: {extra}" if extra else ""
+        part_note = (
+            "\n注意: これは長文の一部分です。この部分の内容のみを要約し、"
+            "「以下は」「この文章は」などの前置きは付けないでください。"
+            if is_part else ""
+        )
         return (
             f"以下の日本語テキストを要約してください。\n"
-            f"形式: {length_instr}{extra_part}\n"
+            f"形式: {length_instr}{extra_part}{part_note}\n"
             f"出力は要約本文のみ（前置き・解説・記号枠は不要）。\n\n"
             f"--- 元のテキスト ---\n{text}\n--- ここまで ---"
         )
 
-    def summarize(self, text: str) -> str | None:
-        """要約後のテキストを返す。失敗時は None。"""
+    def _split_for_summary(self, text: str, max_chars: int) -> list[str]:
+        """要約 API に渡すためのチャンク分割。文末(。！？!?改行)で区切る。"""
+        if len(text) <= max_chars:
+            return [text]
+        import re as _re
+        # 文末候補で区切る（区切り文字は前のチャンクに含める）
+        parts = _re.split(r'(?<=[。！？!?\n])', text)
+        chunks: list[str] = []
+        cur = ""
+        for p in parts:
+            if not p:
+                continue
+            if len(cur) + len(p) > max_chars and cur:
+                chunks.append(cur)
+                cur = p
+            else:
+                cur += p
+        if cur.strip():
+            chunks.append(cur)
+        return chunks
+
+    def summarize(self, text: str,
+                  progress_cb=None) -> str | None:
+        """要約後のテキストを返す。失敗時は None。
+        progress_cb(i, n) を渡すとチャンクごとに進捗を通知する。
+        """
         ok, reason = self.is_available()
         if not ok:
             log.warning(f"要約スキップ: {reason}")
             return None
 
-        prompt = self._build_prompt(text)
+        # 入力を要約処理単位に分割
+        chunks = self._split_for_summary(text, self._config.summary_chunk_chars)
+        log.info(f"要約処理チャンク数: {len(chunks)} (単位 ~{self._config.summary_chunk_chars}文字)")
+
+        if len(chunks) == 1:
+            # 短文: そのまま 1 回で要約
+            if progress_cb:
+                progress_cb(1, 1)
+            return self._summarize_one(chunks[0], is_part=False)
+
+        # 長文: 各チャンクを順次要約して連結
+        summaries: list[str] = []
+        for i, ck in enumerate(chunks):
+            log.info(f"要約 {i+1}/{len(chunks)} ({len(ck)} 文字)")
+            if progress_cb:
+                progress_cb(i + 1, len(chunks))
+            s = self._summarize_one(ck, is_part=True)
+            if s is None:
+                log.warning(f"要約 {i+1}/{len(chunks)} 失敗 → 元テキストをそのまま採用")
+                s = ck
+            summaries.append(s.strip())
+        return "\n\n".join(summaries)
+
+    def _summarize_one(self, text: str, is_part: bool) -> str | None:
+        """単一チャンクを要約する。失敗時は None。"""
+        prompt = self._build_prompt(text, is_part=is_part)
         provider = self._config.summary_provider
         try:
             if provider == "openai":
@@ -1410,9 +1476,17 @@ class HotkeyHandler:
             if overlay is not None:
                 overlay.show("🤖 要約中...", "AI に問い合わせています。少々お待ちください。")
 
+            # チャンクごとの進捗をオーバーレイに表示
+            def _progress(i: int, n: int):
+                if overlay is not None and n > 1:
+                    overlay.update(
+                        f"🤖 要約中... {i}/{n}",
+                        "セクションごとに AI で要約しています。少々お待ちください。",
+                    )
+
             # 要約 API 呼び出し
             t0 = time.monotonic()
-            summary = self._summary.summarize(text)
+            summary = self._summary.summarize(text, progress_cb=_progress)
             elapsed = time.monotonic() - t0
             log.info(f"要約 API 応答時間: {elapsed:.2f}秒")
 

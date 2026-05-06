@@ -210,7 +210,19 @@ length = "medium"             # "short" / "medium" / "long" / "bullet"
 extra_instruction = "話し言葉で簡潔に"
 on_error = "fallback"         # API失敗時の動作: "fallback" / "skip"
 timeout_s = 30                # API タイムアウト秒数
+chunk_chars = 1500            # 長文を区切って要約する単位（小さい=詳細残る、大きい=圧縮）
 ```
+
+### 長文の要約について
+
+長文を 1 回で AI に渡すと過度に圧縮されることが多いため、
+yomiage は `chunk_chars`（デフォルト 1500 文字）で区切って各部分を個別に要約し、
+それらを連結します。
+
+- 短い文章（chunk_chars 以下）→ 1回の API コールで要約
+- 長い文章 → 複数回の API コール（オーバーレイに `🤖 要約中... 3/8` と進捗表示）
+
+`chunk_chars` を小さくすると詳細が残りやすく、大きくすると凝縮されます。
 
 ### 使い方
 
