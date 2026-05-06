@@ -483,9 +483,10 @@ class SummaryEngine:
         return chunks
 
     def summarize(self, text: str,
-                  progress_cb=None) -> str | None:
-        """要約後のテキストを返す。失敗時は None。
+                  progress_cb=None) -> list[tuple[str, str]] | None:
+        """要約結果を [(元セクション, 要約), ...] のリストで返す。失敗時は None。
         progress_cb(i, n) を渡すとチャンクごとに進捗を通知する。
+        短文の場合はリスト長 1 のリストになる。
         """
         ok, reason = self.is_available()
         if not ok:
@@ -496,24 +497,18 @@ class SummaryEngine:
         chunks = self._split_for_summary(text, self._config.summary_chunk_chars)
         log.info(f"要約処理チャンク数: {len(chunks)} (単位 ~{self._config.summary_chunk_chars}文字)")
 
-        if len(chunks) == 1:
-            # 短文: そのまま 1 回で要約
-            if progress_cb:
-                progress_cb(1, 1)
-            return self._summarize_one(chunks[0], is_part=False)
-
-        # 長文: 各チャンクを順次要約して連結
-        summaries: list[str] = []
+        is_part = len(chunks) > 1
+        sections: list[tuple[str, str]] = []
         for i, ck in enumerate(chunks):
             log.info(f"要約 {i+1}/{len(chunks)} ({len(ck)} 文字)")
             if progress_cb:
                 progress_cb(i + 1, len(chunks))
-            s = self._summarize_one(ck, is_part=True)
+            s = self._summarize_one(ck, is_part=is_part)
             if s is None:
                 log.warning(f"要約 {i+1}/{len(chunks)} 失敗 → 元テキストをそのまま採用")
                 s = ck
-            summaries.append(s.strip())
-        return "\n\n".join(summaries)
+            sections.append((ck.strip(), s.strip()))
+        return sections
 
     def _summarize_one(self, text: str, is_part: bool) -> str | None:
         """単一チャンクを要約する。失敗時は None。"""
@@ -609,6 +604,10 @@ class OverlayWindow:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    # 1段モード（通常）と 2段モード（要約: 上=元セクション、下=読み上げ中）の高さ
+    _H_SINGLE = 120
+    _H_DUAL   = 260
+
     def _run(self):
         root = tk.Tk()
         root.withdraw()
@@ -620,32 +619,73 @@ class OverlayWindow:
         # 画面サイズ
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
-        w, h = min(1000, screen_w - 100), 120
+        w = min(1000, screen_w - 100)
         x = (screen_w - w) // 2
 
+        # 現在表示中の高さ（1段 or 2段）
+        state = {"h": self._H_SINGLE, "dual": False}
+
         def _apply_position(pos: str):
+            h = state["h"]
             if pos == "top":
                 y = 40
             else:
                 y = screen_h - h - 80
             root.geometry(f"{w}x{h}+{x}+{y}")
 
-        _apply_position("bottom")
+        # ---------- 上段: コンテキスト（要約モードで使用） ----------
+        context_frame = tk.Frame(root, bg="#0d0d0d")  # 少し暗い背景で区別
+        context_title_lbl = tk.Label(
+            context_frame, text="", font=("Meiryo", 10),
+            fg="#ffaa00", bg="#0d0d0d", anchor="w",
+        )
+        context_title_lbl.pack(fill="x", padx=15, pady=(8, 0))
+        context_text_lbl = tk.Label(
+            context_frame, text="", font=("Meiryo", 11),
+            fg="#cccccc", bg="#0d0d0d", wraplength=w - 30,
+            justify="left", anchor="nw",
+        )
+        context_text_lbl.pack(expand=True, fill="both", padx=15, pady=(4, 8))
+        # 区切り線
+        divider = tk.Frame(root, bg="#444444", height=1)
 
-        # タイトル行
+        # ---------- 下段: 通常表示（読み上げ中の文） ----------
+        main_frame = tk.Frame(root, bg="#1a1a1a")
         title_lbl = tk.Label(
-            root, text="", font=("Meiryo", 10),
+            main_frame, text="", font=("Meiryo", 10),
             fg="#88ccff", bg="#1a1a1a", anchor="w",
         )
         title_lbl.pack(fill="x", padx=15, pady=(8, 0))
-
-        # 本文
         text_lbl = tk.Label(
-            root, text="", font=("Meiryo", 16, "bold"),
+            main_frame, text="", font=("Meiryo", 16, "bold"),
             fg="#ffffff", bg="#1a1a1a", wraplength=w - 30,
             justify="left", anchor="w",
         )
         text_lbl.pack(expand=True, fill="both", padx=15, pady=(4, 10))
+        main_frame.pack(expand=True, fill="both")
+
+        def _enter_dual_mode():
+            if state["dual"]:
+                return
+            # main_frame を一旦外して、上段→区切り→下段の順に詰め直す
+            main_frame.pack_forget()
+            context_frame.pack(fill="x")
+            divider.pack(fill="x")
+            main_frame.pack(expand=True, fill="both")
+            state["dual"] = True
+            state["h"] = self._H_DUAL
+            _apply_position(self._position)
+
+        def _exit_dual_mode():
+            if not state["dual"]:
+                return
+            context_frame.pack_forget()
+            divider.pack_forget()
+            state["dual"] = False
+            state["h"] = self._H_SINGLE
+            _apply_position(self._position)
+
+        _apply_position("bottom")
 
         def poll():
             try:
@@ -664,7 +704,14 @@ class OverlayWindow:
                         title_lbl.config(text=a)
                         text_lbl.config(text=b)
                     elif action == "hide":
+                        _exit_dual_mode()
                         root.withdraw()
+                    elif action == "set_context":
+                        context_title_lbl.config(text=a)
+                        context_text_lbl.config(text=b)
+                        _enter_dual_mode()
+                    elif action == "clear_context":
+                        _exit_dual_mode()
                     elif action == "toggle_position":
                         new_pos = "top" if self._position == "bottom" else "bottom"
                         self._position = new_pos
@@ -689,6 +736,14 @@ class OverlayWindow:
     def toggle_position(self) -> None:
         """オーバーレイの位置を上下で切り替える"""
         self._queue.put(("toggle_position", "", ""))
+
+    def set_context(self, title: str, text: str) -> None:
+        """上段に元セクション（要約元）を表示する"""
+        self._queue.put(("set_context", title, text))
+
+    def clear_context(self) -> None:
+        """上段（コンテキスト）を非表示にして 1 段表示に戻す"""
+        self._queue.put(("clear_context", "", ""))
 
 
 # =====================================================================
@@ -1486,11 +1541,11 @@ class HotkeyHandler:
 
             # 要約 API 呼び出し
             t0 = time.monotonic()
-            summary = self._summary.summarize(text, progress_cb=_progress)
+            sections = self._summary.summarize(text, progress_cb=_progress)
             elapsed = time.monotonic() - t0
             log.info(f"要約 API 応答時間: {elapsed:.2f}秒")
 
-            if not summary:
+            if not sections:
                 log.warning("要約失敗")
                 if overlay is not None:
                     overlay.hide()
@@ -1499,8 +1554,40 @@ class HotkeyHandler:
                     self._speak_text_with_overlay(text)
                 return
 
-            log.info(f"要約結果 ({len(summary)} 文字): {summary[:80]}{'...' if len(summary) > 80 else ''}")
-            self._speak_text_with_overlay(summary)
+            n = len(sections)
+            log.info(f"要約セクション数: {n}")
+
+            # ホットキー（Esc/Tab/Shift+Tab）はループ全体で 1 回だけ登録
+            self._register_esc()
+            self._register_tab()
+            self._register_shift_tab()
+            try:
+                for i, (orig_section, summary_text) in enumerate(sections):
+                    if self._tts._stop_flag.is_set():
+                        log.info("要約読み上げを途中で中断")
+                        break
+                    log.info(
+                        f"セクション {i+1}/{n} 読み上げ "
+                        f"(元={len(orig_section)}文字, 要約={len(summary_text)}文字)"
+                    )
+                    # 上段に元セクションを表示（長すぎる場合は先頭400文字 + …）
+                    if overlay is not None:
+                        ctx = orig_section if len(orig_section) <= 400 \
+                            else orig_section[:400] + " …"
+                        ctx_label = (
+                            f"📄 元のセクション {i+1}/{n}"
+                            if n > 1 else "📄 元の文章"
+                        )
+                        overlay.set_context(ctx_label, ctx)
+                    # 下段に要約を読み上げ（既存の TTS パイプライン）
+                    self._tts.speak(summary_text)
+                    self._tts.wait_done()
+            finally:
+                self._unregister_esc()
+                self._unregister_tab()
+                self._unregister_shift_tab()
+                if overlay is not None:
+                    overlay.clear_context()
         finally:
             self._lock.release()
 
