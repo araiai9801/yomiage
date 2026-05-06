@@ -604,11 +604,11 @@ class OverlayWindow:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    # 1段モード（通常）と 2段モード（要約: 上=元セクション、下=読み上げ中）の高さ
+    # 1段モード（通常）と 2段モード（要約: 上=セクション番号、下=読み上げ中）の高さ
     _H_SINGLE = 120
-    _H_DUAL   = 280
-    # 2段モードでの上段固定高さ（残りが下段になる）
-    _H_CONTEXT = 110
+    _H_DUAL   = 165
+    # 2段モードでの上段固定高さ（セクション番号 1 行だけ）
+    _H_CONTEXT = 36
 
     def _run(self):
         root = tk.Tk()
@@ -635,21 +635,17 @@ class OverlayWindow:
                 y = screen_h - h - 80
             root.geometry(f"{w}x{h}+{x}+{y}")
 
-        # ---------- 上段: コンテキスト（要約モードで使用） ----------
-        # 高さを固定して、長文が下段を押し出さないようにする
+        # ---------- 上段: コンテキスト（要約モードでセクション番号を表示） ----------
+        # 1行だけのコンパクト表示。実際の元文書位置は Ctrl+F ハイライトで示す。
         context_frame = tk.Frame(root, bg="#0d0d0d", height=self._H_CONTEXT)
-        context_frame.pack_propagate(False)  # 中身に応じて伸縮しないようにする
+        context_frame.pack_propagate(False)
         context_title_lbl = tk.Label(
-            context_frame, text="", font=("Meiryo", 11, "bold"),
+            context_frame, text="", font=("Meiryo", 13, "bold"),
             fg="#ffaa00", bg="#0d0d0d", anchor="w",
         )
-        context_title_lbl.pack(fill="x", padx=15, pady=(6, 0))
-        context_text_lbl = tk.Label(
-            context_frame, text="", font=("Meiryo", 12),
-            fg="#cccccc", bg="#0d0d0d", wraplength=w - 30,
-            justify="left", anchor="nw",
-        )
-        context_text_lbl.pack(expand=True, fill="both", padx=15, pady=(2, 6))
+        context_title_lbl.pack(expand=True, fill="both", padx=15, pady=(6, 6))
+        # 互換用（未使用に近いが残す）
+        context_text_lbl = context_title_lbl
         # 区切り線
         divider = tk.Frame(root, bg="#666666", height=2)
 
@@ -711,8 +707,8 @@ class OverlayWindow:
                         _exit_dual_mode()
                         root.withdraw()
                     elif action == "set_context":
+                        # 上段は 1 行のみ。a (タイトル) のみ表示、b は無視。
                         context_title_lbl.config(text=a)
-                        context_text_lbl.config(text=b)
                         _enter_dual_mode()
                     elif action == "clear_context":
                         _exit_dual_mode()
@@ -1411,9 +1407,11 @@ class HotkeyHandler:
                         self._tts.stop_current()
                         self._do_unregister_esc(user32)
                     else:
-                        log.info("Ctrl+Alt+S → 要約読み上げ開始（選択テキスト）")
+                        hwnd = user32.GetForegroundWindow()
+                        log.info(f"Ctrl+Alt+S → 要約読み上げ開始（hwnd={hwnd}）")
                         t = threading.Thread(
-                            target=self._speak_selected_text_summary, daemon=True)
+                            target=self._speak_selected_text_summary,
+                            args=(hwnd,), daemon=True)
                         t.start()
 
             elif msg.message == _MSG_REGISTER_ESC:
@@ -1502,8 +1500,10 @@ class HotkeyHandler:
         finally:
             self._lock.release()
 
-    def _speak_selected_text_summary(self) -> None:
-        """選択テキストを生成 AI で要約してから読み上げる"""
+    def _speak_selected_text_summary(self, hwnd: int = 0) -> None:
+        """選択テキストを生成 AI で要約してから読み上げる。
+        hwnd を渡すと、各セクション読み上げ開始時に元文書の該当箇所を
+        Ctrl+F ハイライトで示す（Chromium 系ブラウザのみ）。"""
         if not self._lock.acquire(blocking=False):
             return
         try:
@@ -1578,19 +1578,18 @@ class HotkeyHandler:
                         f"セクション {i+1}/{n} 読み上げ "
                         f"(元={len(orig_section)}文字, 要約={len(summary_text)}文字)"
                     )
-                    # 上段に元セクションを表示
-                    # 上段は高さ固定なので、文字数も短めに（先頭160字程度）抑える
+                    # 元文書の該当箇所をハイライト（Chromium 系ブラウザのみ）
+                    # _scroll_to_chunk が orig_section の先頭 20 字で Ctrl+F → 検索
+                    if hwnd:
+                        _scroll_to_chunk(orig_section, hwnd)
+                    # 上段にセクション番号のみコンパクト表示（位置確認はハイライトで）
                     if overlay is not None:
-                        ctx = orig_section if len(orig_section) <= 160 \
-                            else orig_section[:160] + " …"
                         ctx_label = (
-                            f"📄 元のセクション {i+1}/{n}"
-                            if n > 1 else "📄 元の文章"
+                            f"📄 元の場所: セクション {i+1}/{n}"
+                            if n > 1 else "📄 元の文章を読み上げ中"
                         )
-                        overlay.set_context(ctx_label, ctx)
-                        # 下段の古い「要約中...」表示をすぐに置き換える。
-                        # MP3 生成に数秒かかるので、その間「音声準備中」を表示。
-                        # （実際の再生開始時に _speak 内で再度 update される）
+                        overlay.set_context(ctx_label, "")
+                        # 下段の古い「要約中...」表示を即座に置き換え（MP3生成中の沈黙対策）
                         section_title = f"📝 要約 {i+1}/{n} 準備中..." if n > 1 else "📝 要約 準備中..."
                         overlay.update(section_title, summary_text[:120] + (" …" if len(summary_text) > 120 else ""))
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
