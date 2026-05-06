@@ -246,13 +246,15 @@ def _is_chromium_browser(hwnd: int) -> bool:
     return "Chrome_WidgetWin" in buf.value
 
 
-def _scroll_to_chunk(chunk_text: str, hwnd: int, keyword_max: int = 200) -> None:
+def _scroll_to_chunk(chunk_text: str, hwnd: int, keyword_max: int = 120) -> None:
     """Chromium 系ブラウザ限定: Ctrl+F でチャンク該当部分をハイライト+スクロール。
-    keyword_max: 検索キーワードの最大文字数。長いほどハイライト範囲が広い。
-    短い文字数だと先頭しかハイライトされないので、要約モードでは長めに渡す。
+    keyword_max: 検索キーワードの最大文字数。
+
+    DOM 要素境界を超えると Chrome の検索は一致しない（例: <h1>title</h1><p>body</p>
+    という構造では "title body" という文字列はマッチしない）。
+    そのため、入力テキストの「最初の十分な長さの行」だけを検索キーにする。
     【重要】Escape を送信しない — SendInput の Escape が RegisterHotKey の
-    「Esc=停止」を誤発動させるため。Find バーは開いたままにする。
-    Word・メモ帳等ではスキップ（Ctrl+F の挙動が異なり干渉するため）。"""
+    「Esc=停止」を誤発動させるため。Find バーは開いたままにする。"""
     if not hwnd or not chunk_text.strip():
         return
     if not _is_chromium_browser(hwnd):
@@ -261,10 +263,18 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int, keyword_max: int = 200) -> None
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         time.sleep(0.15)
 
-        # 改行・連続空白を1スペースに正規化（DOM とのマッチ率を上げる）
+        # DOM 要素境界を超えないよう、入力を行ごとに分割
+        # 最初の長さ 15 文字以上の行を検索キーにする（空行・短い見出しはスキップ）
         raw = chunk_text.strip()
-        import re as _re
-        keyword = _re.sub(r'\s+', ' ', raw)[:keyword_max]
+        lines = [l.strip() for l in raw.replace('\r', '\n').split('\n')]
+        keyword = ""
+        for line in lines:
+            if line and len(line) >= 15:
+                keyword = line[:keyword_max]
+                break
+        if not keyword:
+            # 全部短い行 → 連結して使う
+            keyword = ' '.join(l for l in lines if l)[:keyword_max]
         if not keyword:
             return
         pyperclip.copy(keyword)
@@ -1625,8 +1635,10 @@ class HotkeyHandler:
                             end = len(_orig)
                         part = _orig[start:end].strip()
                         if part:
-                            # keyword_max を高めに（最大 250字）して該当部分が広く一致するように
-                            _scroll_to_chunk(part, _hwnd, keyword_max=250)
+                            # _scroll_to_chunk 側で「最初の十分な長さの行」を抽出するので、
+                            # ここでは単純に該当パートを丸ごと渡す。keyword_max=150 で
+                            # 1段落分くらいまでカバー。
+                            _scroll_to_chunk(part, _hwnd, keyword_max=150)
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
                     # source_hwnd は 0（通常スクロールは無効化）、カスタムコールバック使用。
                     self._tts.speak(summary_text, on_chunk_start=_on_chunk)
