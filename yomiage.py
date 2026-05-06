@@ -1557,6 +1557,10 @@ class HotkeyHandler:
             n = len(sections)
             log.info(f"要約セクション数: {n}")
 
+            # 前回の Esc 停止で立った _stop_flag をクリア
+            # （クリアしないと最初のセクションで即 break してしまう）
+            self._tts._stop_flag.clear()
+
             # ホットキー（Esc/Tab/Shift+Tab）はループ全体で 1 回だけ登録
             self._register_esc()
             self._register_tab()
