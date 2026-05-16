@@ -79,6 +79,7 @@ _VK_R             = 0x52
 _VK_E             = 0x45
 _VK_S             = 0x53
 _VK_T             = 0x54
+_VK_A             = 0x41
 _VK_END           = 0x23
 _VK_ESCAPE        = 0x1B
 
@@ -94,7 +95,8 @@ _HOTKEY_READ      = 1
 _HOTKEY_READ_END  = 3   # Ctrl+Alt+E
 _HOTKEY_PAUSE     = 4   # Tab（読み上げ中のみ）
 _HOTKEY_TOGGLE_POS = 5  # Shift+Tab（読み上げ中のみ・オーバーレイ位置上下切替）
-_HOTKEY_SUMMARY   = 6   # Ctrl+Alt+S（生成AIで要約してから読み上げ）
+_HOTKEY_SUMMARY   = 6   # Ctrl+Alt+S（生成AIで要約してから読み上げ・選択テキスト）
+_HOTKEY_SUMMARY_END = 7  # Ctrl+Alt+A（生成AIで要約してから読み上げ・カーソル位置から末尾まで）
 
 _PS_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
@@ -1443,9 +1445,15 @@ class HotkeyHandler:
 
         ok3 = user32.RegisterHotKey(None, _HOTKEY_SUMMARY, _MOD_CTRL_ALT, _VK_S)
         if ok3:
-            log.info("Ctrl+Alt+S を登録しました（要約してから読み上げ）")
+            log.info("Ctrl+Alt+S を登録しました（選択テキストを要約して読み上げ）")
         else:
             log.warning("RegisterHotKey(Ctrl+Alt+S) 失敗（他アプリが使用中の可能性）")
+
+        ok4 = user32.RegisterHotKey(None, _HOTKEY_SUMMARY_END, _MOD_CTRL_ALT, _VK_A)
+        if ok4:
+            log.info("Ctrl+Alt+A を登録しました（カーソル位置から末尾までを要約して読み上げ）")
+        else:
+            log.warning("RegisterHotKey(Ctrl+Alt+A) 失敗（他アプリが使用中の可能性）")
 
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1491,9 +1499,21 @@ class HotkeyHandler:
                         self._do_unregister_esc(user32)
                     else:
                         hwnd = user32.GetForegroundWindow()
-                        log.info(f"Ctrl+Alt+S → 要約読み上げ開始（hwnd={hwnd}）")
+                        log.info(f"Ctrl+Alt+S → 要約読み上げ開始（選択テキスト, hwnd={hwnd}）")
                         t = threading.Thread(
                             target=self._speak_selected_text_summary,
+                            args=(hwnd,), daemon=True)
+                        t.start()
+                elif msg.wParam == _HOTKEY_SUMMARY_END:
+                    if self._tts.is_speaking:
+                        log.info("Ctrl+Alt+A → 読み上げ停止")
+                        self._tts.stop_current()
+                        self._do_unregister_esc(user32)
+                    else:
+                        hwnd = user32.GetForegroundWindow()
+                        log.info(f"Ctrl+Alt+A → 要約読み上げ開始（カーソル位置から末尾, hwnd={hwnd}）")
+                        t = threading.Thread(
+                            target=self._speak_from_cursor_summary,
                             args=(hwnd,), daemon=True)
                         t.start()
 
@@ -1513,6 +1533,7 @@ class HotkeyHandler:
         user32.UnregisterHotKey(None, _HOTKEY_READ)
         user32.UnregisterHotKey(None, _HOTKEY_READ_END)
         user32.UnregisterHotKey(None, _HOTKEY_SUMMARY)
+        user32.UnregisterHotKey(None, _HOTKEY_SUMMARY_END)
         if self._esc_registered:
             user32.UnregisterHotKey(None, _HOTKEY_ESC)
         if self._tab_registered:
@@ -1584,9 +1605,7 @@ class HotkeyHandler:
             self._lock.release()
 
     def _speak_selected_text_summary(self, hwnd: int = 0) -> None:
-        """選択テキストを生成 AI で要約してから読み上げる。
-        hwnd を渡すと、各セクション読み上げ開始時に元文書の該当箇所を
-        Ctrl+F ハイライトで示す（Chromium 系ブラウザのみ）。"""
+        """選択テキストを生成 AI で要約してから読み上げる。"""
         if not self._lock.acquire(blocking=False):
             return
         try:
@@ -1595,6 +1614,40 @@ class HotkeyHandler:
             if not text:
                 log.info("要約対象テキストが取得できませんでした")
                 return
+            self._do_summary_speak(text, hwnd)
+        finally:
+            self._lock.release()
+
+    def _speak_from_cursor_summary(self, hwnd: int = 0) -> None:
+        """カーソル位置から文末までを取得し、生成 AI で要約してから読み上げる。"""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            time.sleep(0.4)
+            # ホットキー発火時のウィンドウに確実にフォーカスを戻す
+            if hwnd:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+                time.sleep(0.1)
+            text = self._clipboard.get_text_from_cursor()
+            if not text:
+                log.info("カーソル位置からテキストが取得できませんでした")
+                return
+            # 取得後に Left arrow で選択解除（_speak_from_cursor と同じ動作）
+            _release_modifiers()
+            time.sleep(0.05)
+            _send_one_key(0x25, _KEYEVENTF_EXTENDEDKEY)
+            time.sleep(0.05)
+            _send_one_key(0x25, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP)
+            time.sleep(0.05)
+            self._do_summary_speak(text, hwnd)
+        finally:
+            self._lock.release()
+
+    def _do_summary_speak(self, text: str, hwnd: int = 0) -> None:
+        """要約読み上げの共通処理。text の AI 要約 + ストリーミング再生。
+        hwnd を渡すと、各セクション読み上げ開始時に元文書の該当箇所を
+        Ctrl+F ハイライトで示す（Chromium 系ブラウザのみ）。"""
+        try:
             log.info(f"要約対象: {text[:60]}{'...' if len(text) > 60 else ''} ({len(text)} 文字)")
 
             if self._summary is None:
@@ -1718,8 +1771,8 @@ class HotkeyHandler:
                 self._unregister_shift_tab()
                 if overlay is not None:
                     overlay.clear_context()
-        finally:
-            self._lock.release()
+        except Exception as _e:
+            log.error(f"要約読み上げ中に例外: {_e}", exc_info=True)
 
     def _speak_text_with_overlay(self, text: str) -> None:
         """共通: テキストを Esc/Tab/Shift+Tab ホットキー登録付きで読み上げる"""
