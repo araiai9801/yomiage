@@ -497,6 +497,56 @@ class SummaryEngine:
             chunks.append(cur)
         return chunks
 
+    def start_streaming_summary(self, text: str,
+                                 cancel_event=None,
+                                 progress_cb=None):
+        """要約をストリーミング処理する。
+        戻り値: (n_sections, queue.Queue) のタプル。失敗時は None。
+        queue から取り出すと (orig_section, summary_text) のタプル。
+        全完了時は None センチネルが入る。
+        cancel_event: threading.Event。is_set() が True になると要約処理を中断。
+
+        従来の summarize() は全セクション完了を待ってから返すため、長文では
+        最初の音声出るまでの待ち時間が長い。このメソッドはセクション1の要約が
+        できた時点で再生開始でき、残りは裏で並行処理される。"""
+        ok, reason = self.is_available()
+        if not ok:
+            log.warning(f"要約スキップ: {reason}")
+            return None
+        chunks = self._split_for_summary(text, self._config.summary_chunk_chars)
+        n = len(chunks)
+        if n == 0:
+            return None
+        log.info(f"要約処理チャンク数: {n} (ストリーミング)")
+
+        is_part = n > 1
+        q: queue.Queue = queue.Queue()
+
+        def _worker():
+            for j, ck in enumerate(chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    log.info(f"要約ワーカー: キャンセル検出 (j={j+1}/{n})")
+                    q.put(None)
+                    return
+                log.info(f"要約 {j+1}/{n} 開始 ({len(ck)} 文字)")
+                try:
+                    if progress_cb:
+                        progress_cb(j + 1, n)
+                    s = self._summarize_one(ck, is_part=is_part)
+                    if s is None:
+                        log.warning(f"要約 {j+1}/{n} 失敗 → 元テキスト採用")
+                        s = ck
+                    log.info(f"要約 {j+1}/{n} 完了 ({len(s)} 文字)")
+                    q.put((ck.strip(), s.strip()))
+                except Exception as e:
+                    log.error(f"要約 {j+1} 例外: {e}")
+                    q.put((ck.strip(), ck.strip()))
+            q.put(None)
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="summary_streaming").start()
+        return (n, q)
+
     def summarize(self, text: str,
                   progress_cb=None) -> list[tuple[str, str]] | None:
         """要約結果を [(元セクション, 要約), ...] のリストで返す。失敗時は None。
@@ -1566,24 +1616,25 @@ class HotkeyHandler:
             # オーバーレイに「要約中...」表示
             overlay = getattr(self._tts, "_overlay", None)
             if overlay is not None:
-                overlay.show("🤖 要約中...", "AI に問い合わせています。少々お待ちください。")
+                overlay.show("🤖 要約中...", "セクション1の要約が完成し次第、すぐに再生開始します。")
 
             # チャンクごとの進捗をオーバーレイに表示
             def _progress(i: int, n: int):
                 if overlay is not None and n > 1:
                     overlay.update(
                         f"🤖 要約中... {i}/{n}",
-                        "セクションごとに AI で要約しています。少々お待ちください。",
+                        "セクションごとに AI で並行要約しています。",
                     )
 
-            # 要約 API 呼び出し
+            # ストリーミング要約開始（背景スレッドで並行処理開始）
             t0 = time.monotonic()
-            sections = self._summary.summarize(text, progress_cb=_progress)
-            elapsed = time.monotonic() - t0
-            log.info(f"要約 API 応答時間: {elapsed:.2f}秒")
+            cancel_event = threading.Event()
+            result = self._summary.start_streaming_summary(
+                text, cancel_event=cancel_event, progress_cb=_progress
+            )
 
-            if not sections:
-                log.warning("要約失敗")
+            if result is None:
+                log.warning("要約開始失敗")
                 if overlay is not None:
                     overlay.hide()
                 if self._summary._config.summary_on_error == "fallback":
@@ -1591,11 +1642,10 @@ class HotkeyHandler:
                     self._speak_text_with_overlay(text)
                 return
 
-            n = len(sections)
-            log.info(f"要約セクション数: {n}")
+            n, summary_q = result
+            log.info(f"要約セクション数: {n} - 並行処理開始")
 
             # 前回の Esc 停止で立った _stop_flag をクリア
-            # （クリアしないと最初のセクションで即 break してしまう）
             self._tts._stop_flag.clear()
 
             # ホットキー（Esc/Tab/Shift+Tab）はループ全体で 1 回だけ登録
@@ -1603,10 +1653,23 @@ class HotkeyHandler:
             self._register_tab()
             self._register_shift_tab()
             try:
-                for i, (orig_section, summary_text) in enumerate(sections):
-                    if self._tts._stop_flag.is_set():
-                        log.info("要約読み上げを途中で中断")
+                i = 0
+                first_section = True
+                while True:
+                    # キューから次のセクションを取得（背景スレッドが用意するまで待つ）
+                    item = summary_q.get()
+                    if item is None:
+                        log.info("全セクション要約完了")
                         break
+                    if self._tts._stop_flag.is_set():
+                        log.info("要約読み上げを途中で中断（Esc）")
+                        cancel_event.set()
+                        break
+                    orig_section, summary_text = item
+                    if first_section:
+                        elapsed = time.monotonic() - t0
+                        log.info(f"最初のセクション準備時間: {elapsed:.2f}秒")
+                        first_section = False
                     log.info(
                         f"セクション {i+1}/{n} 読み上げ "
                         f"(元={len(orig_section)}文字, 要約={len(summary_text)}文字)"
@@ -1647,7 +1710,9 @@ class HotkeyHandler:
                     # source_hwnd は 0（通常スクロールは無効化）、カスタムコールバック使用。
                     self._tts.speak(summary_text, on_chunk_start=_on_chunk)
                     self._tts.wait_done()
+                    i += 1
             finally:
+                cancel_event.set()  # 残ったワーカーを止める
                 self._unregister_esc()
                 self._unregister_tab()
                 self._unregister_shift_tab()
