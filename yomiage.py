@@ -269,14 +269,21 @@ def _scroll_to_chunk(chunk_text: str, hwnd: int, keyword_max: int = 120) -> None
         # 最初の長さ 15 文字以上の行を検索キーにする（空行・短い見出しはスキップ）
         raw = chunk_text.strip()
         lines = [l.strip() for l in raw.replace('\r', '\n').split('\n')]
+        import re as _re
+        # 行頭の番号/箇条書きマーカー（"4.", "①", "・" など）を除去
+        # HTML の <ol><li> の番号は CSS 生成でDOMには無いため、含むと検索マッチしない
+        def _strip_bullet(s: str) -> str:
+            return _re.sub(r'^[\s　]*([\d一二三四五六七八九十]+[\.\．\)）]|[①-⑳]|[・●○◯◆■□▼▽◇])[\s　]*', '', s)
+
         keyword = ""
         for line in lines:
-            if line and len(line) >= 15:
-                keyword = line[:keyword_max]
+            cleaned = _strip_bullet(line)
+            if cleaned and len(cleaned) >= 15:
+                keyword = cleaned[:keyword_max]
                 break
         if not keyword:
             # 全部短い行 → 連結して使う
-            keyword = ' '.join(l for l in lines if l)[:keyword_max]
+            keyword = ' '.join(_strip_bullet(l) for l in lines if l)[:keyword_max]
         if not keyword:
             return
         pyperclip.copy(keyword)
@@ -1738,32 +1745,24 @@ class HotkeyHandler:
                         section_title = f"📝 要約 {i+1}/{n} 準備中..." if n > 1 else "📝 要約 準備中..."
                         overlay.update(section_title, summary_text[:120] + (" …" if len(summary_text) > 120 else ""))
 
-                    # 元セクションを「再生チャンク数」と同数に分割して、
-                    # 要約再生チャンク i に対して元セクションの i 番目の部分（全体）を
-                    # Ctrl+F でハイライトする。Chromium の検索は数百字でも一致するので、
-                    # 該当部分まるごとを検索キーにすることで広範囲のハイライトを実現。
-                    def _on_chunk(idx: int, total: int, chunk_text: str,
-                                  _orig=orig_section, _hwnd=hwnd):
-                        if not _hwnd or not _orig:
-                            return
-                        # 元セクションを total 等分。idx 番目のスライス全体を検索キーに。
-                        size = max(40, len(_orig) // max(1, total))
-                        start = idx * size
-                        end = min(start + size, len(_orig))
-                        # 最後のチャンクは末尾までカバー
-                        if idx == total - 1:
-                            end = len(_orig)
-                        part = _orig[start:end].strip()
-                        if part:
-                            # _scroll_to_chunk 側で「最初の十分な長さの行」を抽出するので、
-                            # ここでは単純に該当パートを丸ごと渡す。keyword_max=150 で
-                            # 1段落分くらいまでカバー。
-                            _scroll_to_chunk(part, _hwnd, keyword_max=150)
+                    # セクション開始時に 1 回だけ元文書をハイライト（チャンク毎ではなく）。
+                    # チャンク毎の Ctrl+F は検索バー開閉が多すぎて邪魔・かつ
+                    # マッチしないとブラウザがエラー音を鳴らす副作用があるため。
+                    if hwnd and orig_section:
+                        _scroll_to_chunk(orig_section, hwnd, keyword_max=120)
                     # 下段に要約を読み上げ（既存の TTS パイプライン）
-                    # source_hwnd は 0（通常スクロールは無効化）、カスタムコールバック使用。
-                    self._tts.speak(summary_text, on_chunk_start=_on_chunk)
+                    # source_hwnd は渡さない（通常モードのチャンク毎スクロールも無効）。
+                    self._tts.speak(summary_text)
                     self._tts.wait_done()
                     i += 1
+                    # 次セクションがあれば、セクション間に短い間（~0.7秒）を入れる。
+                    # 区切りなしで続けて読まれると、どこまでが 1 セクションか
+                    # 聞いていて分からなくなるため。Esc 押下時は即時抜ける。
+                    if i < n:
+                        _pause_deadline = time.monotonic() + 0.7
+                        while (not self._tts._stop_flag.is_set()
+                               and time.monotonic() < _pause_deadline):
+                            time.sleep(0.05)
             finally:
                 cancel_event.set()  # 残ったワーカーを止める
                 self._unregister_esc()
