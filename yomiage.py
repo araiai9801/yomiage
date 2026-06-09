@@ -384,6 +384,15 @@ chunk_chars = 1500
 #   1.5   - はっきり区切り（推奨）
 #   3.0   - 長めの間
 section_pause_s = 1.5
+
+# 記号区切り（═══ や ──── など）の無音時間（秒）
+# 元のテキストに罫線・装飾文字だけの行がある場合、その位置で取る無音の長さ。
+# 通常読み上げ・要約読み上げ両方に適用。
+#   0     - 記号箇所はスキップ
+#   0.7   - 短め
+#   1.2   - はっきり区切り（推奨）
+#   2.0   - 長め
+symbol_pause_s = 1.2
 """
 
 
@@ -403,6 +412,8 @@ class Config:
         self.summary_chunk_chars: int = 1500
         # セクション間の無音時間（秒）。0 で無音なし、大きいほど区切りがはっきり。
         self.summary_section_pause_s: float = 1.5
+        # 記号区切り（罫線・装飾文字のみ）に置き換える無音時間（秒）
+        self.symbol_pause_s: float = 1.2
 
         # ファイルが無ければ作成
         if not _CONFIG_PATH.exists():
@@ -430,11 +441,14 @@ class Config:
             self.summary_chunk_chars = int(s.get("chunk_chars", self.summary_chunk_chars))
             self.summary_section_pause_s = float(
                 s.get("section_pause_s", self.summary_section_pause_s))
+            self.symbol_pause_s = float(
+                s.get("symbol_pause_s", self.symbol_pause_s))
             log.info(
                 f"設定読み込み完了: provider={self.summary_provider} "
                 f"model={self.summary_model} length={self.summary_length} "
                 f"chunk_chars={self.summary_chunk_chars} "
-                f"section_pause_s={self.summary_section_pause_s}"
+                f"section_pause_s={self.summary_section_pause_s} "
+                f"symbol_pause_s={self.symbol_pause_s}"
             )
         except Exception as e:
             log.warning(f"config.toml 読み込み失敗、デフォルト使用: {e}")
@@ -1119,9 +1133,9 @@ class TTSEngine:
         # 各チャンクを「テキスト」「ポーズ」に分類する。
         # 罫線だけのチャンク（═══ など）は読み上げる文字が無いが、
         # ただスキップすると話題の切れ目が無音化されないので、
-        # 短い無音（ポーズ）動作に置き換える。
+        # 無音（ポーズ）動作に置き換える。長さは config.toml で調整可能。
         # actions: list of (kind, content) -> ("text", cleaned) または ("pause", duration_s)
-        _PAUSE_DURATION = 0.7  # 記号区切りでの無音時間（秒）
+        _PAUSE_DURATION = _CONFIG.symbol_pause_s
         actions: list[tuple[str, object]] = []
         for c in _split_into_chunks(text):
             if not c.strip():
