@@ -1116,12 +1116,37 @@ class TTSEngine:
         _mci("close tts")
 
     def _speak(self, text: str) -> None:
-        # クリーニング後に空になるチャンク（罫線のみなど）を事前除外
-        chunks = [c for c in _split_into_chunks(text) if _clean_for_tts(c).strip()]
+        # 各チャンクを「テキスト」「ポーズ」に分類する。
+        # 罫線だけのチャンク（═══ など）は読み上げる文字が無いが、
+        # ただスキップすると話題の切れ目が無音化されないので、
+        # 短い無音（ポーズ）動作に置き換える。
+        # actions: list of (kind, content) -> ("text", cleaned) または ("pause", duration_s)
+        _PAUSE_DURATION = 0.7  # 記号区切りでの無音時間（秒）
+        actions: list[tuple[str, object]] = []
+        for c in _split_into_chunks(text):
+            if not c.strip():
+                continue
+            cleaned = _clean_for_tts(c).strip()
+            if cleaned:
+                actions.append(("text", cleaned))
+            else:
+                # 全部記号 → ポーズに置換
+                actions.append(("pause", _PAUSE_DURATION))
+        # 連続するポーズはマージ（区切りが3個並んでも 0.7秒×1 だけにする）
+        merged: list[tuple[str, object]] = []
+        for a in actions:
+            if a[0] == "pause" and merged and merged[-1][0] == "pause":
+                continue
+            merged.append(a)
+        actions = merged
+
+        # TTS にかけるテキストチャンクだけ抽出（MP3 生成用）
+        chunks = [a[1] for a in actions if a[0] == "text"]
         if not chunks:
             log.info("読み上げ可能なテキストがありません")
             return
-        log.info(f"TTS 開始 ({len(text)} 文字, {len(chunks)} チャンク, {_TTS_VOICE})")
+        log.info(f"TTS 開始 ({len(text)} 文字, {len(chunks)} テキストチャンク + "
+                 f"{sum(1 for a in actions if a[0]=='pause')} ポーズ, {_TTS_VOICE})")
         self._speaking.set()
         self._stop_flag.clear()
 
@@ -1181,10 +1206,27 @@ class TTSEngine:
             return False
 
         try:
-            for i, chunk in enumerate(chunks):
+            text_chunk_idx = -1  # chunks[] と mp3_files[] のインデックス
+            total_text = len(chunks)
+            for action_idx, (kind, content) in enumerate(actions):
                 if self._stop_flag.is_set():
                     log.info("TTS 中断")
                     break
+
+                # ---- ポーズ動作（記号のみのチャンク）----
+                if kind == "pause":
+                    pause_s = float(content)
+                    log.info(f"記号区切り → {pause_s}秒ポーズ")
+                    _pause_dl = time.monotonic() + pause_s
+                    while (not self._stop_flag.is_set()
+                           and time.monotonic() < _pause_dl):
+                        time.sleep(0.05)
+                    continue
+
+                # ---- テキストチャンク ----
+                text_chunk_idx += 1
+                i = text_chunk_idx
+                chunk = chunks[i]
 
                 # MP3 生成完了を待つ
                 if not _wait_chunk_ready(i):
