@@ -1755,11 +1755,12 @@ class HotkeyHandler:
                     self._tts.speak(summary_text)
                     self._tts.wait_done()
                     i += 1
-                    # 次セクションがあれば、セクション間に短い間（~0.7秒）を入れる。
-                    # 区切りなしで続けて読まれると、どこまでが 1 セクションか
-                    # 聞いていて分からなくなるため。Esc 押下時は即時抜ける。
+                    # 次セクションがあれば、セクション間に間（~1.5秒）を入れる。
+                    # 区切りなしで続けて読まれると、文脈が変わっているのに
+                    # 同じ文章が続いているように聞こえてしまうため、はっきり
+                    # 「文の切れ目だ」と分かる長さを取る。Esc 押下時は即時抜ける。
                     if i < n:
-                        _pause_deadline = time.monotonic() + 0.7
+                        _pause_deadline = time.monotonic() + 1.5
                         while (not self._tts._stop_flag.is_set()
                                and time.monotonic() < _pause_deadline):
                             time.sleep(0.05)
