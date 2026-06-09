@@ -1129,24 +1129,31 @@ class TTSEngine:
         _mci("stop tts")
         _mci("close tts")
 
-    def _speak(self, text: str) -> None:
         # 各チャンクを「テキスト」「ポーズ」に分類する。
-        # 罫線だけのチャンク（═══ など）は読み上げる文字が無いが、
-        # ただスキップすると話題の切れ目が無音化されないので、
+        # 罫線だけのチャンク（═══ など）や 段落区切り（空行）は読み上げる
+        # 文字が無いが、ただスキップすると話題の切れ目が無音化されないので、
         # 無音（ポーズ）動作に置き換える。長さは config.toml で調整可能。
         # actions: list of (kind, content) -> ("text", cleaned) または ("pause", duration_s)
         _PAUSE_DURATION = _CONFIG.symbol_pause_s
         actions: list[tuple[str, object]] = []
-        for c in _split_into_chunks(text):
-            if not c.strip():
-                continue
-            cleaned = _clean_for_tts(c).strip()
-            if cleaned:
-                actions.append(("text", cleaned))
-            else:
-                # 全部記号 → ポーズに置換
+        # まず段落区切り（連続改行 \n\n+）でテキストを分割する。
+        # この時点で各段落間にポーズ動作を挟む。
+        paragraphs = _re.split(r'\n[ 　\t]*\n+', text)
+        for p_idx, para in enumerate(paragraphs):
+            if p_idx > 0:
+                # 段落間ポーズ
                 actions.append(("pause", _PAUSE_DURATION))
-        # 連続するポーズはマージ（区切りが3個並んでも 0.7秒×1 だけにする）
+            # 段落内のチャンク化
+            for c in _split_into_chunks(para):
+                if not c.strip():
+                    continue
+                cleaned = _clean_for_tts(c).strip()
+                if cleaned:
+                    actions.append(("text", cleaned))
+                else:
+                    # 全部記号 → ポーズに置換
+                    actions.append(("pause", _PAUSE_DURATION))
+        # 連続するポーズはマージ（区切りが何個並んでも 1回分のポーズだけ）
         merged: list[tuple[str, object]] = []
         for a in actions:
             if a[0] == "pause" and merged and merged[-1][0] == "pause":
