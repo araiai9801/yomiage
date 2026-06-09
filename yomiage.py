@@ -1129,6 +1129,7 @@ class TTSEngine:
         _mci("stop tts")
         _mci("close tts")
 
+    def _speak(self, text: str) -> None:
         # 各チャンクを「テキスト」「ポーズ」に分類する。
         # 罫線だけのチャンク（═══ など）や 段落区切り（空行）は読み上げる
         # 文字が無いが、ただスキップすると話題の切れ目が無音化されないので、
