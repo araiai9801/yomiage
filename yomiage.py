@@ -375,6 +375,15 @@ timeout_s = 30
 #   大きくする (例: 3000) → コール少ないが圧縮されすぎる
 #   推奨: 1500
 chunk_chars = 1500
+
+# セクション間の無音時間（秒）
+# 要約セクションの読み上げ終了後、次セクションを始めるまでの間。
+# 0 にすると間を取らずに続けて読む。長くするほど区切りがはっきり。
+#   0     - 間なし (詰めて読む)
+#   0.7   - 軽い間
+#   1.5   - はっきり区切り（推奨）
+#   3.0   - 長めの間
+section_pause_s = 1.5
 """
 
 
@@ -392,6 +401,8 @@ class Config:
         self.summary_timeout_s: int = 30
         # 要約処理の単位（文字数）。長文時にこの単位で区切って AI に渡す。
         self.summary_chunk_chars: int = 1500
+        # セクション間の無音時間（秒）。0 で無音なし、大きいほど区切りがはっきり。
+        self.summary_section_pause_s: float = 1.5
 
         # ファイルが無ければ作成
         if not _CONFIG_PATH.exists():
@@ -417,10 +428,13 @@ class Config:
             self.summary_on_error = str(s.get("on_error", self.summary_on_error)).lower()
             self.summary_timeout_s = int(s.get("timeout_s", self.summary_timeout_s))
             self.summary_chunk_chars = int(s.get("chunk_chars", self.summary_chunk_chars))
+            self.summary_section_pause_s = float(
+                s.get("section_pause_s", self.summary_section_pause_s))
             log.info(
                 f"設定読み込み完了: provider={self.summary_provider} "
                 f"model={self.summary_model} length={self.summary_length} "
-                f"chunk_chars={self.summary_chunk_chars}"
+                f"chunk_chars={self.summary_chunk_chars} "
+                f"section_pause_s={self.summary_section_pause_s}"
             )
         except Exception as e:
             log.warning(f"config.toml 読み込み失敗、デフォルト使用: {e}")
@@ -1755,12 +1769,13 @@ class HotkeyHandler:
                     self._tts.speak(summary_text)
                     self._tts.wait_done()
                     i += 1
-                    # 次セクションがあれば、セクション間に間（~1.5秒）を入れる。
-                    # 区切りなしで続けて読まれると、文脈が変わっているのに
-                    # 同じ文章が続いているように聞こえてしまうため、はっきり
-                    # 「文の切れ目だ」と分かる長さを取る。Esc 押下時は即時抜ける。
-                    if i < n:
-                        _pause_deadline = time.monotonic() + 1.5
+                    # 次セクションがあれば、セクション間に間を入れる。
+                    # 区切りなしで続けて読まれると文脈が変わっても同じ文が
+                    # 続いているように聞こえるため。Esc 押下時は即時抜ける。
+                    # 間の長さは config.toml の summary.section_pause_s で調整可。
+                    pause_s = self._summary._config.summary_section_pause_s
+                    if i < n and pause_s > 0:
+                        _pause_deadline = time.monotonic() + pause_s
                         while (not self._tts._stop_flag.is_set()
                                and time.monotonic() < _pause_deadline):
                             time.sleep(0.05)
