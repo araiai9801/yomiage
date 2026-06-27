@@ -899,6 +899,7 @@ _NOISE_CHARS = _re.compile(
     r'■-◿'   # 幾何学図形（■ ▲ ● など）
     r'☀-⛿'   # 各種記号（☀ ★ など）— 必要なら外してください
     r'～'          # ～（全角チルダ）
+    r'`'           # バッククォート（マークダウンコードの ` を読まない）
     r']+'
 )
 
@@ -1145,6 +1146,10 @@ class TTSEngine:
             if p_idx > 0:
                 # 段落間ポーズ
                 actions.append(("pause", _PAUSE_DURATION))
+            # 段落内の単独改行は「一呼吸」を入れたいので「、」に置換する
+            # （句点 。！？!?, の直後の改行はすでに自然なポーズが入るので除去）
+            para = _re.sub(r'(?<=[。！？!?])\n', '', para)
+            para = _re.sub(r'\n', '、', para)
             # 段落内のチャンク化
             for c in _split_into_chunks(para):
                 if not c.strip():
