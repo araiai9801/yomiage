@@ -1150,6 +1150,11 @@ class TTSEngine:
             # （句点 。！？!?, の直後の改行はすでに自然なポーズが入るので除去）
             para = _re.sub(r'(?<=[。！？!?])\n', '', para)
             para = _re.sub(r'\n', '、', para)
+            # マークダウン表などのパイプ | ｜ も「、」に置換して間を入れる
+            # （そのままだと "パイプ" と読まれる/句読点なしで棒読みになる）
+            para = _re.sub(r'[\|｜]', '、', para)
+            # 連続する「、、、」は 1 つにまとめる
+            para = _re.sub(r'、[\s、]*、', '、', para)
             # 段落内のチャンク化
             for c in _split_into_chunks(para):
                 if not c.strip():
