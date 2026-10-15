@@ -93,7 +93,7 @@ Git が無い場合は GitHub の `Code → Download ZIP` で ZIP をダウン�
 コマンドプロンプト（または PowerShell）でフォルダに入り、以下を実行:
 
 ```cmd
-pip install pystray pyperclip pillow edge-tts
+pip install pystray pyperclip pillow "edge-tts>=7.3.1"
 ```
 
 tkinter は Python 標準付属なので追加インストール不要です。
@@ -162,6 +162,19 @@ PowerShell を **管理者として実行** し:
 | 読み上げが途中で止まる | 長文は文単位で分割して再生。ネット断などで途切れた場合は Esc → 選び直し |
 
 ログは `yomiage.log` に出力されます。問題報告の際に添付してください。
+
+### 2026年10月の音声接続方式変更への対応
+
+Microsoft音声サービスの接続認証方式変更に対応するため、`edge-tts 7.3.1` 以上が必要です。
+文字は選択できるのに読まれない、またはログに403エラーが出る場合は、アプリを終了して、
+**起動に使っているPython**で次を実行し、アプリを再起動してください。
+
+```powershell
+python -m pip install --upgrade "edge-tts>=7.3.1"
+```
+
+Pythonが複数ある場合は、`python` の代わりに対象の `python.exe` のフルパスを指定します。
+2026年10月15日に7.3.1で女性音声Nanamiの取得を確認しました。
 
 ---
 

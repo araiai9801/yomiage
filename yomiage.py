@@ -1092,23 +1092,30 @@ class TTSEngine:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            errors="replace",
             creationflags=_PS_FLAGS,
         )
         with self._proc_lock:
             self._gen_proc = proc
         try:
-            proc.wait(timeout=60)
+            # stderrを並行回収する。waitだけではパイプが満杯になると停止する。
+            _, stderr = proc.communicate(timeout=60)
         except subprocess.TimeoutExpired:
-            proc.terminate()
+            proc.kill()
+            proc.communicate()
+            log.error("edge-tts 音声生成が60秒でタイムアウトしました")
             return False
         finally:
             with self._proc_lock:
                 self._gen_proc = None
         if proc.returncode != 0:
-            stderr = proc.stderr.read()[:300] if proc.stderr else ""
-            log.error(f"edge-tts 生成失敗 rc={proc.returncode}: {stderr}")
+            # 末尾の例外名・理由を残す。接続URLにはトークンがあるため除去する。
+            detail = (stderr or "").strip().splitlines()
+            reason = detail[-1] if detail else "詳細なし"
+            reason = reason.split(", url=")[0]
+            log.error("edge-tts 生成失敗 rc=%s: %s", proc.returncode, reason[:1000])
             return False
-        return mp3_path.exists()
+        return mp3_path.exists() and mp3_path.stat().st_size > 0
 
     def _play_mp3(self, mp3_path: Path) -> None:
         """MCI で MP3 を再生し、完了 or stop_flag まで待つ"""
